@@ -728,16 +728,22 @@ class Sampler:
         atol=1e-6,
         rtol=1e-3,
         reverse=False,
+        blend_fn=None,
     ):
         """returns a sampling function with given ODE settings
         Args:
         - sampling_method: type of sampler used in solving the ODE; default to be Dopri5
-        - num_steps: 
+        - num_steps:
             - fixed solver (Euler, Heun): the actual number of integration steps performed
             - adaptive solver (Dopri5): the number of datapoints saved during integration; produced by interpolation
         - atol: absolute error tolerance for the solver
         - rtol: relative error tolerance for the solver
         - reverse: whether solving the ODE in reverse (data to noise); default to False
+        - blend_fn: GeoFix session 6.5 only. `(x, t, drift) -> drift`, applied to
+            the velocity after the drift function and before the solver step.
+            None (the default) leaves the call path byte-for-byte unchanged; see
+            `stage2/transport/blending.py` for why the composite acts on the
+            velocity rather than on the state.
         """
         if reverse:
             drift = lambda x, t, model, **kwargs: self.drift(x, th.ones_like(t) * (1 - t), model, **kwargs)
@@ -762,8 +768,9 @@ class Sampler:
             atol=atol,
             rtol=rtol,
             time_dist_shift=self.transport.time_dist_shift,
+            blend_fn=blend_fn,
         )
-        
+
         return _ode.sample
     
     # def sample_ode_multiview(

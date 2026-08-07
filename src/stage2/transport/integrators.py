@@ -92,10 +92,14 @@ class ode:
         atol,
         rtol,
         time_dist_shift,
+        blend_fn=None,
     ):
         assert t0 < t1, "ODE sampler has to be in forward time"
 
         self.drift = drift
+        # GeoFix session 6.5: mask-weighted latent compositing. None -> the call
+        # path below is byte-for-byte the original. See transport/blending.py.
+        self.blend_fn = blend_fn
         # self.t = th.linspace(t0, t1, num_steps)
         self.t = 1 - th.linspace(t0, t1, num_steps)
         self.t = time_dist_shift * self.t / (1 + (time_dist_shift - 1) * self.t)
@@ -109,6 +113,8 @@ class ode:
         def _fn(t, x):
             t = th.ones(x[0].size(0)).to(device) * t if isinstance(x, tuple) else th.ones(x.size(0)).to(device) * t
             model_output = self.drift(x, t, model, **model_kwargs)
+            if self.blend_fn is not None:
+                model_output = self.blend_fn(x, t, model_output)
             return model_output
         
         t = self.t.to(device)

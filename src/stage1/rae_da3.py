@@ -440,6 +440,13 @@ class RAE_DA3(nn.Module):
         rgb = None
         depth = None
         depth_conf = None
+        # Bound here, not only inside the DPT branch below: with no DPT head the
+        # MAE branch still produces `rgb`, and the return statement then raised
+        # UnboundLocalError on `ray`. GeoFix session 6.5 hit this -- RGB-only
+        # decoding is a supported configuration (the MAE decoder overwrites RGB
+        # anyway), so the missing ray head should yield None, not a crash.
+        ray = None
+        ray_conf = None
 
         # 1. Run DPT decoder if available (produces Depth + initial RGB)
         if self.rae_cl_decoder is not None:
