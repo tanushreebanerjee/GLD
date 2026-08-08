@@ -502,6 +502,25 @@ def _psnr(a: torch.Tensor, b: torch.Tensor) -> float:
 # ---------------------------------------------------------------------------
 
 
+def _payload_for(data, i: int, sample: dict, arm: str, device):
+    """The sample dict `run_sample` wants for one arm, plus the mask to report.
+
+    Shared by the arm loop and `--smoke` so the smoke test cannot exercise a
+    different construction from the run it is gating.
+
+    Returns `(payload, mask)`. `mask` is what goes in the row's `mask_mean`; for
+    arm E that is the middle band, since the hook swaps masks per `t` and no
+    single number describes the area it edited.
+    """
+    if arm == SCHEDULED_ARM:
+        # Arm E carries all three gamma_c channels; the hook picks per t.
+        bands = {name: data.masks_for(i, name).to(device) for _t, name in _schedule()}
+        mask = bands["fisher_g1"]
+        return {**sample, "mask": None, "mask_bands": bands}, mask
+    mask = None if arm == "none" else data.masks_for(i, arm).to(device)
+    return {**sample, "mask": mask}, mask
+
+
 def _dump(img_dir, i, arm, blend_at, rgb, sample, cond_num):
     """Write one decoded target view per arm, plus the artifact and GT once.
 
@@ -762,6 +781,9 @@ def main() -> int:
     if args.dump_images:
         img_dir.mkdir(parents=True, exist_ok=True)
 
+    arms = [a.strip() for a in args.arms.split(",") if a.strip()]
+    levels = [b.strip() for b in args.blend_levels.split(",") if b.strip()]
+
     # --- step 4: the two hook-validation tests, before any arm ----------
     report = {"scene": scene, "n_samples": len(data)}
     if not args.skip_hook_validation:
@@ -785,20 +807,29 @@ def main() -> int:
         # Hook validation alone does not touch `masked_metrics`, and the first
         # array submission died there on a shape it had never been handed --
         # a smoke test that skips the scoring path is not a smoke test.
+        # The FIRST REQUESTED arm, not a fixed one: each submission brings arms
+        # whose mask construction differs (arm E assembles three gamma_c bands
+        # and hands the hook a schedule instead of a mask), and a smoke test
+        # pinned to `oracle_bin` would never enter the path the batch is about
+        # to run 20 times.
+        smoke_arm = arms[0]
+        smoke_level = levels[0]
         s0 = data[0]
         region = upsample_region(data.region_for(0), args.image_size).to(device)
-        mask = data.masks_for(0, "oracle_bin").to(device)
-        res = run_sample(ctx, {**s0, "mask": mask}, "oracle_bin", "l1", args.seed)
+        payload, _mask = _payload_for(data, 0, s0, smoke_arm, device)
+        res = run_sample(ctx, payload, smoke_arm, smoke_level, args.seed)
         m = masked_metrics(res["rgb"].to(device), s0["gt"][0].to(device), region, ctx["lpips"])
         report["smoke_metrics"] = {k: round(v, 6) for k, v in m.items()}
-        print("[6.5] smoke metrics (oracle_bin/l1): "
+        report["smoke_arm"] = f"{smoke_arm}/{smoke_level}"
+        report["smoke_bands"] = res["bands_l1"] or res["bands_l0"]
+        print(f"[6.5] smoke metrics ({smoke_arm}/{smoke_level}): "
               + json.dumps(report["smoke_metrics"]), flush=True)
+        print(f"[6.5] smoke calls={res['n_calls_l1']}/{res['n_calls_l0']} "
+              f"bands={json.dumps(report['smoke_bands'])}", flush=True)
         (out_dir / f"{scene}.smoke.json").write_text(json.dumps(report, indent=2))
         return 0
 
     # --- the arms. D first; it is the load-bearing one. ------------------
-    arms = [a.strip() for a in args.arms.split(",") if a.strip()]
-    levels = [b.strip() for b in args.blend_levels.split(",") if b.strip()]
     plan = [("none", "none")]
     for arm in arms:
         for lv in levels:
@@ -816,15 +847,7 @@ def main() -> int:
         for arm, blend_at in plan:
             if arm == "null_decoy" and not data.null_ok(i, args.null_overlap_max):
                 continue  # a decoy overlapping the real damage is not a null
-            if arm == SCHEDULED_ARM:
-                # Arm E carries all three gamma_c channels; the hook picks per t.
-                bands = {name: data.masks_for(i, name).to(device)
-                         for _t, name in _schedule()}
-                mask = bands["fisher_g1"]   # reported area: the middle band
-                payload = {**sample, "mask": None, "mask_bands": bands}
-            else:
-                mask = None if arm == "none" else data.masks_for(i, arm).to(device)
-                payload = {**sample, "mask": mask}
+            payload, mask = _payload_for(data, i, sample, arm, device)
             t0 = time.time()
             res = run_sample(ctx, payload, arm, blend_at, seed)
             m = masked_metrics(res["rgb"].to(device), gt, region, ctx["lpips"])
