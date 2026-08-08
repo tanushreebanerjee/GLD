@@ -388,8 +388,20 @@ def run_sample(ctx, sample, arm: str, blend_at: str, seed: int) -> dict:
         total_view=v, cond_num=cond, device=device, batch=batch,
         stat_path=stat_path, sample_idx=0,
     )
+    # `decode` returns (B, V, 3, H, W) with B=1 here. Everything downstream --
+    # the metrics, the region mask, the image dump -- indexes on the VIEW axis,
+    # so the batch axis is dropped once, here, rather than guessed at each use.
+    # Getting this wrong does not crash in the obvious place: it broadcasts, and
+    # `se.mean(dim=(1,2,3))` silently returns (1, 504) instead of (V,).
+    rgb = out["rgb"]
+    if rgb.ndim == 5:
+        if rgb.shape[0] != 1:
+            raise RuntimeError(f"expected batch 1, got {rgb.shape[0]}")
+        rgb = rgb[0]
+    if rgb.shape[0] != v:
+        raise RuntimeError(f"decoded {rgb.shape[0]} views, expected {v}")
     return {
-        "rgb": out["rgb"],
+        "rgb": rgb,
         "n_calls_l1": blend1.n_calls,
         "n_calls_l0": blend0.n_calls,
         "bands_l1": dict(blend1.band_calls),
@@ -503,8 +515,7 @@ def _dump(img_dir, i, arm, blend_at, rgb, sample, cond_num):
         a = (t.clamp(0, 1).permute(1, 2, 0).float().cpu().numpy() * 255).astype(np.uint8)
         Image.fromarray(a).save(img_dir / name)
 
-    v = rgb[0] if rgb.ndim == 5 else rgb
-    _save(f"s{i:03d}__{arm}_{blend_at}.png", v[cond_num])
+    _save(f"s{i:03d}__{arm}_{blend_at}.png", rgb[cond_num])
     art = img_dir / f"s{i:03d}__aa_artifact.png"
     if not art.exists():
         _save(art.name, sample["image"][0][cond_num])
@@ -770,6 +781,18 @@ def main() -> int:
             )
         print("[6.5] hook validation PASSED", flush=True)
     if args.smoke:
+        # Run ONE blended arm all the way through the metrics before stopping.
+        # Hook validation alone does not touch `masked_metrics`, and the first
+        # array submission died there on a shape it had never been handed --
+        # a smoke test that skips the scoring path is not a smoke test.
+        s0 = data[0]
+        region = upsample_region(data.region_for(0), args.image_size).to(device)
+        mask = data.masks_for(0, "oracle_bin").to(device)
+        res = run_sample(ctx, {**s0, "mask": mask}, "oracle_bin", "l1", args.seed)
+        m = masked_metrics(res["rgb"].to(device), s0["gt"][0].to(device), region, ctx["lpips"])
+        report["smoke_metrics"] = {k: round(v, 6) for k, v in m.items()}
+        print("[6.5] smoke metrics (oracle_bin/l1): "
+              + json.dumps(report["smoke_metrics"]), flush=True)
         (out_dir / f"{scene}.smoke.json").write_text(json.dumps(report, indent=2))
         return 0
 
