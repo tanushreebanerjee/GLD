@@ -279,20 +279,47 @@ class LatentBlend:
         return m.reshape(bv, *m.shape[2:])
 
 
-#: Arm E's gamma_c schedule, keyed on GLD's DESCENDING `t`.
+#: Arm E's gamma_c schedule, in FreeFix's units: STEP FRACTION, not `t`.
 #:
 #: FreeFix's `c_scheduler: [0.3, 0.9, 1.0]` over 50 steps puts steps 0-14 on
 #: gamma_c=0.001, 15-44 on 0.01 and 45-49 on 0.1 -- loosest first, steepest last.
-#: Their step fraction `f` maps to our `t = 1 - f`, hence the reversal:
-#:
-#:     t > 0.7          -> fisher_g0 (gamma_c=0.001, widest dynamic range)
-#:     0.1 < t <= 0.7   -> fisher_g1 (gamma_c=0.01)
-#:     t <= 0.1         -> fisher_g2 (gamma_c=0.1,  narrowest, near-binary)
-#:
 #: Ordering by dynamic range is what transfers, not the cutoffs: their gamma_c is
 #: a linear pre-rasterisation scale, ours an exponent after median-normalised
-#: accumulation. The boundaries are asserted through `band_calls`, not eyeballed.
-GAMMA_C_SCHEDULE = ((0.7, "fisher_g0"), (0.1, "fisher_g1"), (float("-inf"), "fisher_g2"))
+#: accumulation.
+#:
+#: Kept in step fraction because that is the only place the boundaries are
+#: stable. `gamma_c_schedule` converts them to the `t` the hook sees.
+GAMMA_C_SCHEDULE_F = ((0.3, "fisher_g0"), (0.9, "fisher_g1"), (1.0, "fisher_g2"))
+
+
+def gamma_c_schedule(time_dist_shift: float):
+    """Step-fraction bands -> the descending-`t` bands `arm_schedule` wants.
+
+    GLD does not step linearly in `t`. The sampler builds its grid as
+
+        t = s*u / (1 + (s - 1)*u),   u = 1 - f,   s = time_dist_shift
+
+    and `s` is 22.0454 at 504x504, which crushes the grid toward `t = 1`: of the
+    49 drift evaluations, 45 land above `t = 0.7` and one below `t = 0.1`.
+
+    An earlier version of this schedule mapped FreeFix's `f` straight through as
+    `t = 1 - f`, which is only correct when `s = 1`. Measured, it put 45/4/0
+    calls in the three bands -- arm E silently degenerating into arm B's
+    `fisher_g0` while still looking like a schedule. Applying the same warp the
+    sampler applies restores FreeFix's own 15/30/5 split.
+
+    `band_calls` on the hook is what asserts this, per run. It is the reason
+    that counter exists.
+    """
+    s = float(time_dist_shift)
+    bands = []
+    for f, label in GAMMA_C_SCHEDULE_F:
+        u = 1.0 - float(f)
+        t = s * u / (1.0 + (s - 1.0) * u)
+        bands.append((t, label))
+    # The last band must catch everything left, whatever rounding did to it.
+    bands[-1] = (float("-inf"), bands[-1][1])
+    return tuple(bands)
 
 
 def constant_mask(like: th.Tensor, value: float) -> th.Tensor:

@@ -99,8 +99,13 @@ SCHEDULED_ARM = "fisher_sched"
 
 
 def _schedule():
-    from stage2.transport.blending import GAMMA_C_SCHEDULE
-    return GAMMA_C_SCHEDULE
+    """Arm E's bands as `(step_fraction, name)`. Only the NAMES are used here.
+
+    The `t` a band starts at depends on `time_dist_shift`, which is a property of
+    the loaded checkpoint, so it is resolved in `run_sample` where that is known.
+    """
+    from stage2.transport.blending import GAMMA_C_SCHEDULE_F
+    return GAMMA_C_SCHEDULE_F
 
 
 # ---------------------------------------------------------------------------
@@ -308,7 +313,7 @@ def run_sample(ctx, sample, arm: str, blend_at: str, seed: int) -> dict:
     exactly the stages named and disarmed otherwise, so a run that reports
     `n_calls == 0` on a stage did not blend there whatever its metrics say.
     """
-    from stage2.transport.blending import GAMMA_C_SCHEDULE, LatentBlend
+    from stage2.transport.blending import LatentBlend, gamma_c_schedule
     from utils.da3_validation_metric import get_denoised_features
     from eval_gld_metric import get_cascade_features
 
@@ -329,7 +334,7 @@ def run_sample(ctx, sample, arm: str, blend_at: str, seed: int) -> dict:
         f_art = encode_artifact(rae, batch["image"], level, stat_path, device)
         if arm == SCHEDULED_ARM:
             bands = [(t_low, sample["mask_bands"][name].to(device), name)
-                     for t_low, name in GAMMA_C_SCHEDULE]
+                     for t_low, name in gamma_c_schedule(ctx["time_dist_shift"])]
             return hook.arm_schedule(f_art, bands)
         return hook.arm(f_art, sample["mask"].to(device))
 
@@ -704,6 +709,9 @@ def build_context(args, device) -> dict:
         "stat_path": stat_path,
         "num_views": ctx_num_views,
         "cond_num": cond_num,
+        # Arm E's band boundaries are step fractions and have to be warped
+        # through this to become the `t` the hook compares against.
+        "time_dist_shift": time_dist_shift,
         "hw": (h, w),
         "token_grid": h // PATCH,
         "use_prope": bool(stage2_params.get("use_prope", False)),
