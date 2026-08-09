@@ -865,10 +865,17 @@ def main() -> int:
                 "scene": scene, "split": sample["split"], "sample": i,
                 "arm": arm, "blend_at": blend_at,
                 # How much of the frame this arm actually generates over. Not a
-                # metric -- a confound. `null_decoy` max-pools to a mean of 0.707
-                # against `oracle_bin`'s 0.370, so arm C edits nearly twice the
-                # area of the ceiling arm and any "C wins" reading has to survive
-                # that. Recorded per row so the caveat travels with the number.
+                # metric -- a confound, and its SIGN is counter-intuitive. Arm A
+                # (pure generation, M == 1) scores BELOW the artifact renders
+                # (15.605 vs 16.189 dB), so a LOW mask mean preserves more
+                # artifact and scores higher for free. `null_decoy` max-pools to
+                # 0.707 against `oracle_bin`'s 0.370: arm C generates over twice
+                # the area, which pushes it DOWN, so C is a weaker control than
+                # it looks -- the risk is "C loses for free", not "C wins". By
+                # the same token `fisher_g2` (0.062) barely edits and will look
+                # good on raw delta-vs-A for no other reason. `chord_excess` in
+                # geofix.blend.report is what removes this; rank arms there.
+                # Recorded per row so the caveat travels with the number.
                 "mask_mean": None if mask is None else round(float(mask.mean()), 6),
                 "n_calls_l1": res["n_calls_l1"], "n_calls_l0": res["n_calls_l0"],
                 "bands_l1": res["bands_l1"], "bands_l0": res["bands_l0"],
