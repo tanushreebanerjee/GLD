@@ -212,6 +212,7 @@ class DiTwDDTHead(nn.Module):
             architecture_mode: str = "new", # "new" (split embedders) or "old" (single embedders)
             cfg_mode: str = "new",          # "new" (drop pose/intrinsics) or "old" (keep pose/intrinsics)
             num_special_tokens: int = 0,    # number of special tokens (e.g. 5 for VGGT camera+register)
+            n_mask: int = 0,                # GeoFix session 7: extra INPUT channels for uncertainty masks
     ):
         super().__init__()
         self.level = level
@@ -227,6 +228,21 @@ class DiTwDDTHead(nn.Module):
 
         # In concat mode, input has 2*in_channels: [condition | noisy]
         embed_in_channels = in_channels * 2 if is_concat_mode else in_channels
+
+        # GeoFix session 7, step 2: uncertainty-mask conditioning.
+        #
+        # Widens ONLY the patch-embedder input: [condition | noisy | mask], mask
+        # LAST. The output path is untouched -- `self.x_channel_per_token` below
+        # is computed from `in_channels`, so `final_layer` still emits C. The
+        # mask is an input, never a prediction.
+        #
+        # n_mask=0 is the default and reproduces upstream exactly, so this line
+        # is inert for every existing config. See models/mask_conditioning.py for
+        # the checkpoint adapter (a narrow checkpoint CANNOT load into a widened
+        # embedder -- size mismatch raises even under strict=False) and for why
+        # `id(module)` deduplication matters in architecture_mode "old".
+        self.n_mask = int(n_mask)
+        embed_in_channels = embed_in_channels + self.n_mask
 
         self.encoder_hidden_size = hidden_size[0]
         self.decoder_hidden_size = hidden_size[1]
