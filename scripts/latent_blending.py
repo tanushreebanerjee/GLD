@@ -118,9 +118,31 @@ class SplitSamples:
 
     Views are the frames session 6 cached masks for -- evenly strided across a
     split's render views -- taken in order, so the first `cond_num` are the
-    reference half of the trajectory and the rest are generated. All of them are
-    ARTIFACT renders: refs are degraded too, which is the realistic refinement
-    setting and the one session 7 targets. GT is used only for scoring.
+    reference half of the trajectory and the rest are generated. GT is used only
+    for scoring.
+
+    **What fills the reference half is a choice, not plumbing**, and both options
+    are implemented:
+
+    - `clean_refs_root=None` (the default, and what arm D and arms B/C/E ran):
+      every view is an ARTIFACT render, so the references are degraded too. An
+      earlier version of this docstring called that "the realistic refinement
+      setting and the one session 7 targets". The second half was wrong --
+      `docs/SESSION_7.md:132` asks for clean refs in `[0, cond_num)` -- and the
+      first half is arguable, since the training photographs exist at test time
+      by construction and both baselines we are tabled against consume them.
+    - `clean_refs_root=<path>`: the reference half comes from
+      `geofix.blend.clean_refs`, which crops the nearest TRAINING photographs
+      through the same 504 box. The target half is untouched, so the frames being
+      scored are identical to the degraded-reference run and the two are paired.
+
+    **In clean-reference mode the reference views have different camera poses
+    from anything in `gt`, so a full-frame metric over all `V` views is
+    meaningless.** `masked_metrics(..., first_view=cond_num)` is the only
+    admissible reduction there, and `main` refuses to emit the all-view numbers.
+    That restriction is worth applying to the degraded-reference runs too: views
+    below `cond_num` are never blended (`transport/blending.py:100-103`), so they
+    decode identically in every arm and averaging them in halves every effect.
     """
 
     def __init__(
@@ -131,11 +153,14 @@ class SplitSamples:
         num_views: int,
         cond_num: int,
         splits_per_scene: int | None = None,
+        clean_refs_root: pathlib.Path | None = None,
     ):
         self.artifact_root = pathlib.Path(artifact_root)
         self.gt_root = pathlib.Path(gt_root)
         self.num_views = int(num_views)
         self.cond_num = int(cond_num)
+        self.clean_refs_root = (
+            pathlib.Path(clean_refs_root) if clean_refs_root else None)
 
         frame_ids = [str(f) for f in tokens["frame_id"]]
         by_split: dict[str, list[int]] = {}
@@ -179,6 +204,14 @@ class SplitSamples:
             poses.append(cam["pose"])
             intrinsics.append(cam["intrinsic"])
 
+        if self.clean_refs_root is not None:
+            # Overwrite ONLY the reference half. `gts` keeps the render views'
+            # ground truth throughout, including for the slots just replaced --
+            # those entries are now unpaired with `imgs`, which is why every
+            # metric in this mode starts at `first_view=cond_num`.
+            targets = [self.frame_ids[j].split("/")[-1] for j in idx[self.cond_num:]]
+            self._swap_in_clean_refs(split, targets, imgs, poses, intrinsics)
+
         to_t = lambda a: torch.from_numpy(np.stack(a)).permute(0, 3, 1, 2).float() / 255.0  # noqa: E731
         return {
             "split": split,
@@ -189,6 +222,54 @@ class SplitSamples:
             "c2w": torch.from_numpy(np.stack(poses)).float()[None],      # (1,V,4,4)
             "intrinsic": torch.from_numpy(np.stack(intrinsics)).float()[None],
         }
+
+    def _swap_in_clean_refs(self, split, targets, imgs, poses, intrinsics) -> None:
+        """Replace views `[0, cond_num)` with the training photographs, in place.
+
+        The pack is built by `geofix.blend.clean_refs` in our repo, where the
+        camera code and `pycolmap` already live; everything that happens here is
+        reading four PNGs and four poses. That split is deliberate (GeoFix hard
+        rule 9 -- keep the fork diff surgical), but it means the sample grouping
+        is stated in two places: `SplitSamples.__init__` above and
+        `clean_refs.group_samples` there. The pack records the target frames it
+        selected against, so the duplication is CHECKED here rather than trusted
+        -- a drift between the two would otherwise silently pair each reference
+        with a target it is not near, which looks like "clean references do not
+        help" and not like a bug.
+        """
+        import json
+
+        from PIL import Image   # imported per-call, as `__getitem__` does
+
+        d = self.clean_refs_root / split
+        man_path = d / "refs.json"
+        if not man_path.is_file():
+            raise SystemExit(
+                f"{man_path} not found. Build the packs first:\n"
+                "  PYTHONPATH=src python -m geofix.blend.clean_refs "
+                "--config configs/data/dl3dv_sparse.yaml "
+                "--eval-config configs/eval/blend_6_5.yaml "
+                "--tokens eval/blend/tokens --out eval/blend/clean_refs")
+        man = json.loads(man_path.read_text())
+
+        if list(man["targets"]) != list(targets):
+            raise SystemExit(
+                f"{split}: the clean-reference pack was built against targets "
+                f"{list(man['targets'])} but this sample's targets are {list(targets)}. "
+                "The two sample groupings have drifted -- rebuild the packs with the "
+                "same --eval-config this run uses.")
+        if len(man["refs"]) != self.cond_num:
+            raise SystemExit(
+                f"{split}: pack has {len(man['refs'])} references for cond_num="
+                f"{self.cond_num}.")
+
+        for e in man["refs"]:
+            j = int(e["slot"])
+            stem = e["stem"]
+            imgs[j] = np.asarray(Image.open(d / "images_4" / f"{stem}.png").convert("RGB"))
+            cam = np.load(d / "images_4" / f"{stem}.npz")
+            poses[j] = cam["pose"]
+            intrinsics[j] = cam["intrinsic"]
 
     def masks_for(self, i: int, arm: str) -> torch.Tensor:
         """`M_edit` on the token grid for this sample's views, `(V,1,g,g)`."""
@@ -213,12 +294,34 @@ class SplitSamples:
 # ---------------------------------------------------------------------------
 
 
+def score_views(pred: torch.Tensor, gt: torch.Tensor, region: torch.Tensor, ctx) -> dict:
+    """Metrics on the generated half, plus the all-view numbers when they mean something.
+
+    `*_tgt` (views `[cond_num, V)`) is always emitted and is the primary set: it
+    is the only half any arm can change, and under `--clean-refs` it is the only
+    half that has a ground truth at all.
+
+    The unsuffixed all-view keys are emitted ONLY with degraded references, where
+    they are well defined -- they are what arm D and arms B/C/E reported, so
+    keeping them lets an old run and a new one be compared without re-running
+    the old one. They are absent, rather than present-and-wrong, under
+    `--clean-refs`: a reader who greps `psnr` out of a clean-reference row should
+    get a `KeyError`, not a number computed against another camera's photograph.
+    """
+    out = {f"{k}_tgt": v for k, v in
+           masked_metrics(pred, gt, region, ctx["lpips"], ctx["cond_num"]).items()}
+    if not ctx["clean_refs"]:
+        out.update(masked_metrics(pred, gt, region, ctx["lpips"]))
+    return out
+
+
 def upsample_region(region: torch.Tensor, size: int) -> torch.Tensor:
     """Token-grid region -> pixel mask, nearest, `(V,1,H,W)`."""
     return torch.nn.functional.interpolate(region, size=(size, size), mode="nearest")
 
 
-def masked_metrics(pred: torch.Tensor, gt: torch.Tensor, region: torch.Tensor, lpips_fns) -> dict:
+def masked_metrics(pred: torch.Tensor, gt: torch.Tensor, region: torch.Tensor, lpips_fns,
+                   first_view: int = 0) -> dict:
     """PSNR / SSIM / LPIPS full-frame and restricted to `region`.
 
     All three are reduced over the region rather than computed on a crop: SSIM
@@ -226,11 +329,23 @@ def masked_metrics(pred: torch.Tensor, gt: torch.Tensor, region: torch.Tensor, l
     the same pixels PSNR uses, and a crop would change their receptive fields.
 
     Every arm gets the SAME region -- the oracle's. See the module docstring.
+
+    `first_view` drops the leading views before reducing. Pass `cond_num` to
+    score only the generated half. Two independent reasons to want that:
+
+    - Views below `cond_num` are never blended (`transport/blending.py:100-103`),
+      so they decode to the same pixels in every arm. Averaging them in does not
+      bias any comparison, but it halves every difference at `cond_num == V/2`,
+      which is what the session-6.5 tables report.
+    - Under `--clean-refs` those views are training photographs at training-view
+      poses. They have no counterpart in `gt` at all, and a full-frame number
+      there is not diluted but meaningless.
     """
     from utils.metrics import compute_ssim
 
-    pred = pred.clamp(0, 1)
-    gt = gt.clamp(0, 1)
+    pred = pred[first_view:].clamp(0, 1)
+    gt = gt[first_view:].clamp(0, 1)
+    region = region[first_view:]
     out = {}
 
     se = (pred - gt) ** 2
@@ -723,6 +838,7 @@ def build_context(args, device) -> dict:
         "cfg_uncond_mode": guidance.get("cfg_l1_uncond_mode", "keep"),
         "lpips": lpips_fns,
         "eval_cfg": eval_cfg,
+        "clean_refs": bool(args.clean_refs),
     }
 
 
@@ -740,6 +856,11 @@ def main() -> int:
     ap.add_argument("--stats-dir", required=True)
     ap.add_argument("--artifact-root", required=True)
     ap.add_argument("--gt-root", required=True)
+    ap.add_argument("--clean-refs", default=None, metavar="DIR",
+                    help="fill the reference half [0, cond_num) from the TRAINING "
+                         "photographs in this pack (geofix.blend.clean_refs) instead "
+                         "of from artifact renders. Only `*_tgt` metrics are emitted, "
+                         "since the reference views then have no counterpart in GT.")
     ap.add_argument("--tokens", required=True, help="eval/blend/tokens/<scene>.npz")
     ap.add_argument("--out", required=True)
     ap.add_argument("--arms",
@@ -775,9 +896,26 @@ def main() -> int:
     scene = pathlib.Path(args.tokens).stem
     ctx = build_context(args, device)
 
+    # SESSION_7.md step 3 asks for TWO assertions, not one. The ordering itself is
+    # structural here -- `SplitSamples` builds the reference half as the prefix and
+    # `_swap_in_clean_refs` writes into slots `[0, cond_num)`. What is not
+    # structural is that the model AGREES the prefix is the reference half:
+    # `_get_view_order` puts references first in every mode, but `random` and
+    # `interpolate` also CHOOSE which views are references, so under either of
+    # them the training photographs would land in generated slots and be scored
+    # against render-view GT. This checks a config value a copied eval yaml would
+    # silently change, and it is the more important of the two.
+    if args.clean_refs and ctx["ref_view_sampling"] != "prefix":
+        raise SystemExit(
+            f"--clean-refs needs ref_view_sampling='prefix', got "
+            f"{ctx['ref_view_sampling']!r}. Under {ctx['ref_view_sampling']!r} the "
+            "loader also chooses which views are references, so the clean views "
+            "would not occupy the reference slots they were built for.")
+
     data = SplitSamples(
         args.artifact_root, args.gt_root, tokens,
         ctx["num_views"], ctx["cond_num"], args.splits_per_scene,
+        clean_refs_root=args.clean_refs,
     )
     print(f"[6.5] scene {scene[:12]}: {len(data)} samples of {ctx['num_views']} views", flush=True)
     if len(data) == 0:
@@ -793,7 +931,13 @@ def main() -> int:
     levels = [b.strip() for b in args.blend_levels.split(",") if b.strip()]
 
     # --- step 4: the two hook-validation tests, before any arm ----------
-    report = {"scene": scene, "n_samples": len(data)}
+    # `clean_refs` goes in the report because it changes what the metric MEANS,
+    # not just its value: a row set without it carries all-view keys and one with
+    # it does not. A merge of the two that lost this field would silently compare
+    # 8-view numbers against 4-view ones.
+    report = {"scene": scene, "n_samples": len(data),
+              "clean_refs": args.clean_refs, "cond_num": ctx["cond_num"],
+              "scored_views": f"[{ctx['cond_num']}, {ctx['num_views']})"}
     if not args.skip_hook_validation:
         s0 = data[0]
         print("[6.5] hook validation ...", flush=True)
@@ -826,7 +970,7 @@ def main() -> int:
         region = upsample_region(data.region_for(0), args.image_size).to(device)
         payload, _mask = _payload_for(data, 0, s0, smoke_arm, device)
         res = run_sample(ctx, payload, smoke_arm, smoke_level, args.seed)
-        m = masked_metrics(res["rgb"].to(device), s0["gt"][0].to(device), region, ctx["lpips"])
+        m = score_views(res["rgb"].to(device), s0["gt"][0].to(device), region, ctx)
         report["smoke_metrics"] = {k: round(v, 6) for k, v in m.items()}
         report["smoke_arm"] = f"{smoke_arm}/{smoke_level}"
         report["smoke_bands"] = res["bands_l1"] or res["bands_l0"]
@@ -858,12 +1002,16 @@ def main() -> int:
             payload, mask = _payload_for(data, i, sample, arm, device)
             t0 = time.time()
             res = run_sample(ctx, payload, arm, blend_at, seed)
-            m = masked_metrics(res["rgb"].to(device), gt, region, ctx["lpips"])
+            m = score_views(res["rgb"].to(device), gt, region, ctx)
             if i < args.dump_images:
                 _dump(img_dir, i, arm, blend_at, res["rgb"], sample, ctx["cond_num"])
             rows.append({
                 "scene": scene, "split": sample["split"], "sample": i,
                 "arm": arm, "blend_at": blend_at,
+                # Per ROW, not just per report: these jsonl files get merged
+                # (`report --in A --in B`), and a clean-reference row and a
+                # degraded-reference row are not the same measurement.
+                "clean_refs": bool(args.clean_refs),
                 # How much of the frame this arm actually generates over. Not a
                 # metric -- a confound, and its SIGN is counter-intuitive. Arm A
                 # (pure generation, M == 1) scores BELOW the artifact renders
@@ -883,8 +1031,9 @@ def main() -> int:
                 **{k: round(v, 6) for k, v in m.items()},
             })
             print(f"[6.5] {scene[:8]} s{i:03d} {arm:>14s}/{blend_at:<4s} "
-                  f"psnr={m['psnr']:.3f} masked={m['psnr_masked']:.3f} "
-                  f"lpips={m['lpips']:.4f} calls={res['n_calls_l1']}/{res['n_calls_l0']}",
+                  f"psnr_tgt={m['psnr_tgt']:.3f} masked_tgt={m['psnr_masked_tgt']:.3f} "
+                  f"lpips_tgt={m['lpips_tgt']:.4f} "
+                  f"calls={res['n_calls_l1']}/{res['n_calls_l0']}",
                   flush=True)
 
         with (out_dir / f"{scene}.jsonl").open("w") as fh:
