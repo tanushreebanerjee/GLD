@@ -266,10 +266,27 @@ def main():
                                                / "configs" / "training"))
     p.add_argument("--n-mask", type=int, default=1)
     p.add_argument("--device", default="cuda")
+    # float32 only, and NOT an oversight -- see the check in main().
     p.add_argument("--dtype", default="float32", choices=["float32", "bfloat16"])
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--models", default="level1,cascade")
     args = p.parse_args()
+
+    if args.dtype == "bfloat16":
+        raise SystemExit(
+            "--dtype bfloat16 is not a runnable configuration, and the fault is upstream in\n"
+            "ProPE, not in the mask surgery. The two requirements are mutually exclusive:\n"
+            "  prope.py:306  einsum(_lift_K(Ks_norm), viewmats)  needs the poses FP32\n"
+            "                -> bf16 poses raise 'expected scalar type Float but found BFloat16'\n"
+            "  prope.py:380  _apply_tiled_projmat                needs them to MATCH the\n"
+            "                bf16 activations\n"
+            "                -> fp32 poses raise 'expected scalar type BFloat16 but found Float'\n"
+            "No dtype assignment satisfies both (measured: jobs 7238536 and 7238548).\n\n"
+            "This costs the gate nothing. Nothing in this project runs the model in bf16 --\n"
+            "eval and training keep fp32 weights and never autocast, while attention\n"
+            "internally downcasts q/k/v to bf16 on its own (model_utils.py:608). The fp32\n"
+            "gate therefore already exercises the deployed precision, bf16 attention included."
+        )
 
     torch.manual_seed(args.seed)
     torch.backends.cudnn.benchmark = False
