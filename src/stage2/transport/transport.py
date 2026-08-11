@@ -729,6 +729,8 @@ class Sampler:
         rtol=1e-3,
         reverse=False,
         blend_fn=None,
+        init_t=None,
+        init_steps=None,
     ):
         """returns a sampling function with given ODE settings
         Args:
@@ -769,8 +771,15 @@ class Sampler:
             rtol=rtol,
             time_dist_shift=self.transport.time_dist_shift,
             blend_fn=blend_fn,
+            init_t=init_t,
+            init_steps=init_steps,
         )
 
+        # A BOUND method, so `fn.__self__` is the `ode` above and `fn.__self__.t`
+        # is the (possibly truncated) time grid. GeoFix's img2img arm reads
+        # `t[0]` off it to build the initial state on the path's own interpolant
+        # rather than recomputing the `time_dist_shift` warp, which is exactly
+        # the kind of duplicated formula that drifts silently.
         return _ode.sample
     
     # def sample_ode_multiview(

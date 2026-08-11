@@ -93,6 +93,8 @@ class ode:
         rtol,
         time_dist_shift,
         blend_fn=None,
+        init_t=None,
+        init_steps=None,
     ):
         assert t0 < t1, "ODE sampler has to be in forward time"
 
@@ -100,9 +102,45 @@ class ode:
         # GeoFix session 6.5: mask-weighted latent compositing. None -> the call
         # path below is byte-for-byte the original. See transport/blending.py.
         self.blend_fn = blend_fn
+
+        def _warp(u):
+            return time_dist_shift * u / (1 + (time_dist_shift - 1) * u)
+
         # self.t = th.linspace(t0, t1, num_steps)
-        self.t = 1 - th.linspace(t0, t1, num_steps)
-        self.t = time_dist_shift * self.t / (1 + (time_dist_shift - 1) * self.t)
+        self.t = _warp(1 - th.linspace(t0, t1, num_steps))
+
+        # GeoFix: the img2img arm, for comparability with FreeFix (an img2img
+        # refiner at `strength: 0.5`). It starts the trajectory from the encoded
+        # ARTIFACT noised to `init_t` rather than from pure noise.
+        #
+        # This CANNOT be done by truncating the grid above, and the reason is
+        # `time_dist_shift` (22.05 for this checkpoint). That warp is extremely
+        # convex: 47 of the 50 default steps sit above t = 0.5, and the grid then
+        # falls 0.665 -> 0.022 in its last few entries. So the two readings of
+        # "strength 0.5" come apart completely here, where in SDXL they roughly
+        # agree:
+        #
+        #   keep the last 50% of STEPS  -> starts at t = 0.955, i.e. 95% noise.
+        #                                  The artifact contributes 4.5% and the
+        #                                  arm is indistinguishable from arm A.
+        #   start at NOISE LEVEL t=0.5  -> only 3 steps remain. Undersampled by
+        #                                  8x against FreeFix's 25.
+        #
+        # Neither is the comparison we want. So the grid is REBUILT on the
+        # sub-interval [t_end, init_t] with `init_steps` points, using GLD's own
+        # warp so the spacing philosophy is unchanged -- solve `_warp(u) = init_t`
+        # for the linear coordinate and lay the points out there. That gives
+        # FreeFix's step count AT a genuine noise level, which is the only
+        # version of this arm that tests what it claims to.
+        if init_t is not None:
+            n = int(init_steps or num_steps)
+            if not 0.0 < init_t <= 1.0:
+                raise ValueError(f"init_t must be in (0, 1], got {init_t}")
+            # inverse of `_warp`
+            u_hi = init_t / (time_dist_shift - init_t * (time_dist_shift - 1))
+            u_lo = 1 - t1        # the linear coordinate the full grid ends at
+            self.t = _warp(th.linspace(u_hi, u_lo, n))
+
         self.atol = atol
         self.rtol = rtol
         self.sampler_type = sampler_type

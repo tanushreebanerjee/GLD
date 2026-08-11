@@ -458,7 +458,17 @@ def run_sample(ctx, sample, arm: str, blend_at: str, seed: int) -> dict:
     if blend_at in ("l0", "both"):
         _arm(blend0, 0)
 
-    sample_fn_1 = ctx["make_sample_fn"](blend1 if blend1.enabled else None)
+    # img2img applies to STAGE 1 ONLY. FreeFix's `strength` truncates the single
+    # denoising trajectory that produces the image; GLD's second stage is a
+    # learned L1 -> L0 cascade conditioned on the stage-1 result, not a second
+    # refinement of the render, and there is no FreeFix counterpart to truncate.
+    # Truncating it too would change the cascade's input distribution as well as
+    # its length, confounding the comparison this arm exists to make.
+    init_t = ctx.get("img2img_t")
+    f_art1 = encode_artifact(rae, batch["image"], 1, stat_path, device) if init_t else None
+    sample_fn_1 = ctx["make_sample_fn"](blend1 if blend1.enabled else None,
+                                        init_t=init_t, init_steps=ctx.get("img2img_steps"),
+                                        f_artifact=f_art1)
     sample_fn_0 = ctx["make_sample_fn"](blend0 if blend0.enabled else None)
 
     feat, feat_denorm = {}, {}
@@ -788,8 +798,46 @@ def build_context(args, device) -> dict:
     sampler = Sampler(transport)
     sampler_params = OmegaConf.to_container(model_cfg.get("sampler", {}), resolve=True).get("params", {})
 
-    def make_sample_fn(blend_fn):
-        return sampler.sample_ode(**sampler_params, blend_fn=blend_fn)
+    def make_sample_fn(blend_fn, init_t=None, init_steps=None, f_artifact=None):
+        """`sample_ode`, optionally started from the artifact instead of noise.
+
+        `strength=None` is the session-6.5 path and is byte-for-byte unchanged.
+
+        With `init_t=t` this becomes the FreeFix-comparable arm: FreeFix is an
+        img2img refiner (`strength: 0.5`, `ours/refine_by_sdxl.py`), so its
+        trajectory STARTS at the encoded degraded render rather than at noise.
+        Two things have to move together, and moving only one is silent:
+
+          * the time grid is rebuilt on `[t_end, init_t]` (in `ode.__init__`,
+            which carries the reason it is rebuilt and not merely truncated)
+          * the state is re-initialised ON the path's interpolant at that `t`
+
+        GLD's path is `path.ICPlan` with `x_t = (1 - t) * F + t * eps`, so the
+        correct half-noised artifact at `t` is `(1 - t) * F_art + t * eps`. We
+        reuse the SAME `eps` the seeded `randn` already drew, so an arm at a
+        given seed still shares its noise with every other arm.
+        """
+        fn = sampler.sample_ode(**sampler_params, blend_fn=blend_fn,
+                                init_t=init_t, init_steps=init_steps)
+        if init_t is None:
+            return fn
+
+        t_start = float(fn.__self__.t[0])   # see the note in Sampler.sample_ode
+
+        def _from_artifact(x, model, **kwargs):
+            # Concat mode lays the tensor out as [ref_cond | x_t] on dim 1, and
+            # only the SECOND half is integrated (blending.py § the channel
+            # split). Writing into the first half would corrupt the conditioning
+            # without crashing.
+            c = f_artifact.shape[1]
+            if x.shape[1] != 2 * c:
+                raise SystemExit(
+                    f"img2img expects concat mode ({2 * c} channels), got {x.shape[1]}")
+            eps = x[:, c:]
+            x = torch.cat([x[:, :c], (1.0 - t_start) * f_artifact + t_start * eps], dim=1)
+            return fn(x, model, **kwargs)
+
+        return _from_artifact
 
     from lpips import LPIPS
     lpips_fns = (LPIPS(net="alex").to(device).eval(),
@@ -839,6 +887,8 @@ def build_context(args, device) -> dict:
         "lpips": lpips_fns,
         "eval_cfg": eval_cfg,
         "clean_refs": bool(args.clean_refs),
+        "img2img_t": args.img2img_t,
+        "img2img_steps": args.img2img_steps,
     }
 
 
@@ -875,6 +925,16 @@ def main() -> int:
     ap.add_argument("--splits-per-scene", type=int, default=None)
     ap.add_argument("--cfg-scale", type=float, default=None)
     ap.add_argument("--cfg-scale-cascade", type=float, default=None)
+    ap.add_argument("--img2img-t", type=float, default=None, metavar="T",
+                    help="start stage 1 from the encoded ARTIFACT noised to t=T on "
+                         "GLD's own path (x_t = (1-t)F + t*eps), instead of from "
+                         "pure noise. T=0.5 is the analogue of FreeFix's "
+                         "`strength: 0.5`. NOT a step fraction -- time_dist_shift "
+                         "makes those two readings disagree wildly; see "
+                         "stage2/transport/integrators.py. Off by default.")
+    ap.add_argument("--img2img-steps", type=int, default=25, metavar="N",
+                    help="steps for the --img2img-t grid. 25 matches FreeFix's "
+                         "int(50 * 0.5). Ignored unless --img2img-t is given.")
     ap.add_argument("--null-overlap-max", type=float, default=0.05)
     ap.add_argument("--hook-tol-db", type=float, default=30.0)
     ap.add_argument("--seed", type=int, default=0)
@@ -937,7 +997,8 @@ def main() -> int:
     # 8-view numbers against 4-view ones.
     report = {"scene": scene, "n_samples": len(data),
               "clean_refs": args.clean_refs, "cond_num": ctx["cond_num"],
-              "scored_views": f"[{ctx['cond_num']}, {ctx['num_views']})"}
+              "scored_views": f"[{ctx['cond_num']}, {ctx['num_views']})",
+              "img2img_t": args.img2img_t, "img2img_steps": args.img2img_steps}
     if not args.skip_hook_validation:
         s0 = data[0]
         print("[6.5] hook validation ...", flush=True)
@@ -1012,6 +1073,7 @@ def main() -> int:
                 # (`report --in A --in B`), and a clean-reference row and a
                 # degraded-reference row are not the same measurement.
                 "clean_refs": bool(args.clean_refs),
+                "img2img_t": args.img2img_t,
                 # How much of the frame this arm actually generates over. Not a
                 # metric -- a confound, and its SIGN is counter-intuitive. Arm A
                 # (pure generation, M == 1) scores BELOW the artifact renders
