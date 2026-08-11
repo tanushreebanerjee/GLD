@@ -29,24 +29,36 @@ doubled and not widened). The mask is an input, never a prediction.
 `camera_embedder` is a separate path on `cam_in_channels = 7` and is untouched --
 it is deliberately absent from `_EMBEDDER_ATTRS`.
 
-## The two architecture modes are NOT symmetric
+## Three shapes of model, not two
 
-    level-1 model   DA3_level1.yaml:34    architecture_mode "new"   4 embedders
-    cascade model   DA3_cascade.yaml:33   architecture_mode "old"   2 embedders
+    level-1 model    DA3_level1.yaml:34   DDT.DiTwDDTHead      "new"   4 modules, 4 keys
+    cascade model    DA3_cascade.yaml:33  DDT_old.DiTwDDTHead          2 modules, 2 keys
+    (reachable)      --                   DDT.DiTwDDTHead      "old"   2 modules, 6 keys
 
-In `"old"` mode `DDT.py:273-277` aliases `_ref`/`_tgt` onto the same module, so a
-loop over the four attribute names visits each module **twice**. Everything here
-deduplicates on `id(module)`. `SESSION_7.md` step 2 said "the four PatchEmbeds in
-both models"; that is wrong for the cascade and is corrected in
-`docs/ARCH_NOTES.md` § CORRECTION 2026-08-10.
+**`"old"` selects a different CLASS, not a branch.** `latent_blending.py:707`
+rewrites the config target to `DDT_old.DiTwDDTHead` whenever it sees
+`architecture_mode: "old"`, so the released cascade never runs `DDT.py` at all.
+`DDT_old` registers `x_embedder`/`s_embedder` and nothing else -- no `_ref`/`_tgt`
+aliases -- which is why it is the boring 2-and-2 row.
+
+`DDT.py`'s own `"old"` branch is the interesting one: `DDT.py:273-277` aliases
+`_ref`/`_tgt` onto the shared modules, so a loop over the four attribute names
+visits each module **twice**, and `state_dict()` emits six keys for two modules.
+That path is dead code for eval but reachable for anything that instantiates
+`DDT` directly, so it is still handled here.
+
+`SESSION_7.md` step 2 said "the four PatchEmbeds in both models"; that is wrong
+for the cascade. See `docs/ARCH_NOTES.md` § CORRECTION 2026-08-10 and the
+§ SHARPENING that follows it.
 
 **`named_modules()` and `state_dict()` disagree about aliases, and the difference
 is load-bearing.** `named_modules()` memoizes on identity and yields an aliased
 module **once**; `state_dict()` recurses through `_modules` and emits it under
-**every** registered name. So the cascade's 2 distinct embedders produce **6**
-state-dict keys (`s_embedder`, `x_embedder`, and the four `_ref`/`_tgt`
-aliases). Measured, not assumed: an adapter that padded only the deduplicated
-names left 4 of 6 keys narrow and the load still failed with 4 size mismatches.
+**every** registered name. So `DDT.py`'s 2 distinct embedders in `"old"` mode
+produce **6** state-dict keys (`s_embedder`, `x_embedder`, and the four
+`_ref`/`_tgt` aliases). Measured, not assumed: an adapter that padded only the
+deduplicated names left 4 of 6 keys narrow and the load still failed with 4 size
+mismatches.
 
 Hence the two-function split below, which is the whole subtlety of this file:
 

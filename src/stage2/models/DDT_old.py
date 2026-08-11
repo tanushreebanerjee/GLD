@@ -209,6 +209,7 @@ class DiTwDDTHead(nn.Module):
             predict_cls: bool = False,
             is_concat_mode: bool = False,  # If True, input has 2*in_channels (condition + noisy)
             source_condition_mode: str = None, # "l1_to_x0" | "l1_as_cond" | None
+            n_mask: int = 0,                # GeoFix session 7: extra INPUT channels for uncertainty masks
     ):
         super().__init__()
         self.level = level
@@ -221,6 +222,29 @@ class DiTwDDTHead(nn.Module):
         
         # In concat mode, input has 2*in_channels: [condition | noisy]
         embed_in_channels = in_channels * 2 if is_concat_mode else in_channels
+
+        # GeoFix session 7, step 2: uncertainty-mask conditioning. Mirrors the
+        # hook in DDT.py -- widens ONLY the patch-embedder input, mask LAST, so
+        # `self.x_channel_per_token` below (computed from `in_channels`) and the
+        # camera path are untouched. n_mask=0 reproduces upstream exactly.
+        #
+        # THIS CLASS IS THE CASCADE. `latent_blending.py:707` rewrites an
+        # `architecture_mode: "old"` config's target to `DDT_old.DiTwDDTHead`, so
+        # DDT.py's own "old" branch is NOT what the released cascade checkpoint
+        # runs -- and the two differ: DDT.py aliases `_ref`/`_tgt` onto the shared
+        # modules (6 state-dict keys for 2 modules), while this class registers
+        # `x_embedder`/`s_embedder` and nothing else (2 keys for 2 modules).
+        # See docs/ARCH_NOTES.md § CORRECTION 2026-08-10.
+        self.n_mask = int(n_mask)
+        embed_in_channels = embed_in_channels + self.n_mask
+        if self.n_mask > 0 and predict_cls:
+            # `cls_embedder` takes `x[:, :, 0, 0]`, whose width follows the input
+            # we just widened, but is built with `in_channels`. Both configs set
+            # predict_cls: false, so this is unreachable today -- it is here so a
+            # future config flips it into an error rather than a shape mismatch
+            # three frames deeper.
+            raise ValueError("n_mask > 0 with predict_cls is not supported: cls_embedder is built "
+                             "on in_channels and would not see the widened input")
 
         self.encoder_hidden_size = hidden_size[0]
         self.decoder_hidden_size = hidden_size[1]
@@ -513,6 +537,14 @@ class DiTwDDTHead(nn.Module):
                 C = self.in_channels
                 cond_part = x_patches[:, :C]  # Reference condition (C channels)
                 encoder_input = torch.cat([cond_part, source_condition], dim=1)
+                # GeoFix session 7: this branch REBUILDS the encoder input from
+                # scratch (cond + L1) instead of passing `x_patches` through, so
+                # widening `s_embedder` alone leaves it 2C wide against a 2C+n_mask
+                # embedder -- a hard shape error, not a silent one. Re-append the
+                # mask so the encoder sees the same [.. | mask] layout as the
+                # decoder below, which consumes `x_patches` directly.
+                if self.n_mask > 0:
+                    encoder_input = torch.cat([encoder_input, x_patches[:, -self.n_mask:]], dim=1)
                 s = self.s_embedder(encoder_input)
             else:
                 s = self.s_embedder(x_patches)

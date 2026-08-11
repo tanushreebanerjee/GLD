@@ -243,6 +243,11 @@ class DiTwDDTHead(nn.Module):
         # `id(module)` deduplication matters in architecture_mode "old".
         self.n_mask = int(n_mask)
         embed_in_channels = embed_in_channels + self.n_mask
+        if self.n_mask > 0 and predict_cls:
+            # See DDT_old.py: cls_embedder is built on in_channels and would not
+            # see the widened input. Unreachable with both shipped configs.
+            raise ValueError("n_mask > 0 with predict_cls is not supported: cls_embedder is built "
+                             "on in_channels and would not see the widened input")
 
         self.encoder_hidden_size = hidden_size[0]
         self.decoder_hidden_size = hidden_size[1]
@@ -624,7 +629,13 @@ class DiTwDDTHead(nn.Module):
                     sc = sc_flat.reshape(BV, -1, H_grid, W_grid)
 
                 encoder_input = torch.cat([cond_part, sc], dim=1)
-                
+                # GeoFix session 7: see the identical note in DDT_old.py. This
+                # branch rebuilds the encoder input rather than passing
+                # `x_patches` through, so the mask has to be re-appended or the
+                # widened s_embedder gets a 2C tensor.
+                if self.n_mask > 0:
+                    encoder_input = torch.cat([encoder_input, x_patches[:, -self.n_mask:]], dim=1)
+
                 # Separate Ref/Tgt embedding for source condition
                 cond_num = kwargs.get("cond_num", total_view // 2) # Default if not provided
                 ei_5d = rearrange(encoder_input, "(b v) c h w -> b v c h w", v=total_view)
