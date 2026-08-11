@@ -134,7 +134,15 @@ def make_cameras(device, dtype, *, n_views, image_size, radius=2.0, arc=0.6):
     K[0, 0] = K[1, 1] = f
     K[0, 2] = K[1, 2] = image_size / 2
     Ks = K.repeat(n_views, 1, 1).unsqueeze(0)
-    return (viewmats.to(device=device, dtype=dtype), Ks.to(device=device, dtype=dtype))
+
+    # ALWAYS fp32, never the model dtype. `prope.py:306` does
+    # `einsum(_lift_K(Ks_norm), viewmats)` against fp32 internals and raises
+    # "expected scalar type Float but found BFloat16" on anything else. This
+    # matches training and eval, which build poses from the dataset in fp32 and
+    # never cast them -- poses are geometry, not activations.
+    del dtype
+    return (viewmats.to(device=device, dtype=torch.float32),
+            Ks.to(device=device, dtype=torch.float32))
 
 
 def make_inputs(device, dtype, *, seed, n_mask, source_condition):
