@@ -83,7 +83,7 @@ def convert_cut3r_batch(
     # Each view dict contains 'idx' = (sample_idx, ar_idx, view_idx) as tensors.
     cut3r_idx = [v.get('idx', None) for v in reordered]
     
-    return {
+    out = {
         'gt_inp': gt_inp,           # (B, V, C, H, W) in [0,1]
         'fxfycxcy': fxfycxcy,       # (B, V, 4)
         'c2w': c2w,                 # (B, V, 4, 4)
@@ -91,6 +91,31 @@ def convert_cut3r_batch(
         'frame_indices': frame_indices,
         'cut3r_idx': cut3r_idx,     # List[V] of CUT3R (sample_idx, ar_idx, view_idx)
     }
+
+    # GeoFix session 7, step 4: carry the uncertainty mask and the clean target.
+    #
+    # This function builds its output dict from an explicit key list, so ANY key
+    # the dataset adds is dropped here silently -- the batch simply arrives
+    # without a mask and training proceeds as if masks were switched off. That is
+    # the failure mode this block exists to prevent, and it is why the keys are
+    # reordered with `reordered` rather than read off `cut3r_batch`: a mask that
+    # survived the view permutation unpermuted would be paired with the wrong
+    # view, which is worse than not having one.
+    #
+    # `mask` is (B, V, n_mask, g, g) already on the token grid and already
+    # MAX-pooled by `video/geofix_pairs.py`; polarity is edit1, 1.0 = edit here.
+    for key, out_key in (('mask', 'mask'), ('is_ref', 'is_ref')):
+        if key in reordered[0]:
+            out[out_key] = torch.stack([v[key] for v in reordered], dim=1)
+
+    # `gt_clean` goes through the SAME denormalisation as `gt_inp` above. It is
+    # the training target for the degraded views and `gt_inp` is the conditioning;
+    # leaving one ImageNet-normalised and the other in [0,1] would put target and
+    # input on different scales, and the loss would still look finite.
+    if 'gt' in reordered[0]:
+        gt = torch.stack([v['gt'] for v in reordered], dim=1)
+        out['gt_clean'] = (gt * std + mean).clamp(0, 1)
+    return out
 
 
 def _get_view_order(
