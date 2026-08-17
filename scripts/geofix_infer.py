@@ -97,24 +97,48 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
 
+#: CUT3R's convention, and the source of a bug that cost a whole smoke run.
+#: `GeoFixPairs._img` returns IMAGENET-NORMALISED tensors (range about [-2.1, 2.6]),
+#: because every CUT3R loader does; `cut3r_adapter.convert_cut3r_batch` then converts
+#: them BACK to [0, 1] (`gt_inp = imgs * std + mean`, line 62) before
+#: `prepare_data`/`get_denoised_features` apply the normalisation once, for real.
+_IMAGENET_MEAN = (0.485, 0.456, 0.406)
+_IMAGENET_STD = (0.229, 0.224, 0.225)
+
+
 def build_batch(views: list[dict], device) -> dict:
-    """Stack one sample's per-view dicts into the (1, V, ...) batch `run_sample` wants.
+    """Stack one sample's per-view dicts into the (1, V, ...) batch the sampler wants.
 
     `GeoFixPairs.__getitem__` returns CUT3R's list-of-per-view-dicts. The training
     path stacks it with `collate` and then `convert_cut3r_batch`; here there is one
     sample and no DataLoader, so the stack is explicit -- and the key names are the
-    ones `get_denoised_features` accepts (`image` / `c2w` / `intrinsic`), not
-    CUT3R's.
+    ones `get_denoised_features` accepts (`image` / `c2w` / `intrinsic`).
+
+    **The de-normalisation below is NOT optional, and omitting it does not crash.**
+    Skipping it double-normalises every image: the loader's ImageNet transform, then
+    `get_denoised_features`' own `(images - rae.encoder_mean) / rae.encoder_std`.
+    Measured cost of that bug: stock GLD generation at 13.25 dB against the render's
+    17.39, decoding to blocky, cyan-cast patch mush -- which looks enough like "the
+    model is bad" to be mistaken for a result. It is the reason this function exists
+    instead of a bare `torch.stack`, and the reason `convert_cut3r_batch` is quoted
+    above rather than paraphrased.
     """
     def stack(key):
         return torch.stack([v[key] for v in views]).unsqueeze(0).to(device)
 
+    mean = torch.tensor(_IMAGENET_MEAN, device=device).view(1, 1, 3, 1, 1)
+    std = torch.tensor(_IMAGENET_STD, device=device).view(1, 1, 3, 1, 1)
+
+    def denorm(x):
+        return (x * std + mean).clamp(0, 1)
+
     return {
-        "image": stack("img"),            # the 3DGS renders + clean refs, as loaded
+        # [0, 1], exactly what convert_cut3r_batch hands the training path.
+        "image": denorm(stack("img")),    # 3DGS renders in [cond_num, V), clean refs below
         "c2w": stack("camera_pose"),
         "intrinsic": stack("camera_intrinsics"),
-        "gt": stack("gt"),
-        "mask": stack("mask"),
+        "gt": denorm(stack("gt")),
+        "mask": stack("mask"),            # a mask is not an image; never normalised
     }
 
 
@@ -268,6 +292,17 @@ def main() -> int:
                 f"sample {i} ({split}) has {len(stems)} targets, expected {v - cond}.")
 
         batch = build_batch(dataset[i], device)
+        # Cheap, and it catches the double-normalisation class of bug at the one
+        # place it can enter. [0,1] imagery is the contract every downstream
+        # normalise() assumes; ImageNet-normalised input reads about [-2.1, 2.6].
+        if done == 0:
+            lo, hi = float(batch["image"].min()), float(batch["image"].max())
+            if lo < -0.01 or hi > 1.01:
+                raise ValueError(
+                    f"batch['image'] range [{lo:.3f}, {hi:.3f}] is not [0,1]. The "
+                    "loader emits ImageNet-normalised tensors and build_batch must "
+                    "undo that, exactly as cut3r_adapter.convert_cut3r_batch does.")
+            print(f"[infer] image range [{lo:.3f}, {hi:.3f}] OK", flush=True)
         geo_batch = {k: batch[k] for k in ("image", "c2w", "intrinsic")}
 
         art = batch["image"] if args.cond_artifact else None
