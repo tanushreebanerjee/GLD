@@ -500,6 +500,21 @@ def main(args):
     geofix_cfg = cfg.get("geofix", {}) or {}
     geofix_cond_artifact = bool(geofix_cfg.get("cond_artifact", False))
     geofix_mask_in_camera = bool(geofix_cfg.get("mask_in_camera", False))
+    # The ablation arm runs off the SAME config file with this flag, rather than a
+    # second copy of it. Two files would let anything else drift between the arms,
+    # and the one comparison that isolates the mask from the render is worthless if
+    # a second thing moved with it. A generic `--set key=value` would NOT be safe
+    # here: `parse_configs` re-loads the config from disk (line ~344), so an
+    # override applied to `cfg` never reaches `dataset_config` or `model_config`.
+    # This flag only touches a value read from `cfg` and nowhere else.
+    if getattr(args, "geofix_no_mask", False):
+        if not geofix_mask_in_camera:
+            raise ValueError(
+                "--geofix-no-mask given but geofix.mask_in_camera is already false "
+                "in the config. The flag exists to run the ablation arm off the "
+                "mask-ON config; passing it to a mask-OFF config means one of the "
+                "two is not what you think it is.")
+        geofix_mask_in_camera = False
     if (geofix_cond_artifact or geofix_mask_in_camera) and dataset_name.lower() != "geofix":
         raise ValueError(
             f"geofix.* conditioning is on but dataset.name={dataset_name!r}. "
@@ -1660,6 +1675,13 @@ if __name__ == "__main__":
     parser.add_argument("--max-steps", type=int, default=None,
                         help="Stop after N optimizer steps, saving a checkpoint first. "
                              "For smoke tests (GeoFix: 'smoke test before every real run').")
+    parser.add_argument("--geofix-no-mask", action="store_true",
+                        help="Force geofix.mask_in_camera off, leaving cond_artifact "
+                             "as configured. This is the GeoFix ablation arm -- "
+                             "refinement WITHOUT the mask, which is the honest "
+                             "baseline for 'does the mask add anything'. Uses the "
+                             "same config file as the mask-on arm so nothing else "
+                             "can differ between them.")
 
     args = parser.parse_args()
     # Log level info
