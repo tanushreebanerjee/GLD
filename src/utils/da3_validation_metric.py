@@ -125,6 +125,13 @@ def get_denoised_features(
     use_camera_drop=True,  # NEW
     cfg_uncond_mode='keep',  # NEW
     batch=None,
+    # GeoFix session 8. `batch['image']` here is the CLEAN reference/target imagery
+    # the stock path encodes; these two carry the render and the mask separately, so
+    # inference fills the same slots training filled. See utils/geofix_slots.py --
+    # the semantics live there, not here, because three code paths build this
+    # conditioning and they have to agree exactly.
+    geofix_artifact_images=None,  # (B, V, 3, H, W) 3DGS renders -> condition slot
+    geofix_mask=None,             # (B, V, 1, g, g) M_edit on the token grid
 ):
     """
     Diffusion sampling to generate denoised features at a single level.
@@ -207,6 +214,11 @@ def get_denoised_features(
     # Add condition mask
     random_masks = torch.ones((B, V, 1, H, W), device=device, dtype=latents_all.dtype)
     random_masks[:, :cond_num] = 0
+    # GeoFix slot 2. Measured NOT to train -- see utils/geofix_slots.py before
+    # using this arm for anything but reproducing the 2026-08-17 result.
+    if geofix_mask is not None:
+        from utils.geofix_slots import grade_camera_mask
+        grade_camera_mask(random_masks, geofix_mask.to(device), cond_num, (H, W))
     random_masks = random_masks.reshape(B * V, 1, H, W)
     camera_embedding = torch.cat([random_masks, camera_embedding], dim=1)
     
@@ -219,6 +231,19 @@ def get_denoised_features(
     
     latents_cond_5d = torch.zeros(B, V, C_lat, h_lat, w_lat, device=device, dtype=latents_all.dtype)
     latents_cond_5d[:, :cond_num] = latents_ref_5d
+    # GeoFix slot 1: the target half stops being zeros and carries the render.
+    if geofix_artifact_images is not None:
+        from utils.geofix_slots import fill_cond_artifact
+        if geofix_artifact_images.shape != images.shape:
+            raise ValueError(
+                f"artifact images {tuple(geofix_artifact_images.shape)} must match "
+                f"images {tuple(images.shape)}.")
+        with torch.no_grad():
+            art_norm = ((geofix_artifact_images.to(device)
+                         - rae.encoder_mean[None].to(device))
+                        / rae.encoder_std[None].to(device))
+            latents_art = rae.encode(art_norm, level=rae.level)
+        fill_cond_artifact(latents_cond_5d, latents_art, cond_num)
     latents_cond = latents_cond_5d.reshape(B * V, C_lat, h_lat, w_lat)
     
     # Prepare sample input: ALL views start as noise at t=1 (matching training)
