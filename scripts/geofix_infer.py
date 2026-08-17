@@ -24,10 +24,18 @@ generated half -- arm A, the oracle bounds, the clean-reference result -- came
 through exactly this decode. A fresh sampler here would produce a figure that could
 not be compared to any of them, and the discrepancy would look like a result.
 
-It is NOT a scorer. `geofix.score_arms` already does per-scene paired PSNR / LPIPS
-/ hf_ratio and takes `--arm NAME=DIR`, so this writes into the layout that module
-walks (`<out>/K_XX/<split>/<frame>.png`) and stops. One paired-comparison
-implementation for the whole project.
+It is NOT a scorer. It writes `<out>/K_XX/<split>/<frame>.png` and stops.
+
+**Score these arms with `geofix.baselines.flux2d --mode score/report`, not with
+`geofix.score_arms`.** Both read this layout, but `score_arms` enumerates splits off
+the export tree instead of the manifest and delegates to
+`blend.report.paired_deltas`, which emits **no t statistic** and does not aggregate
+`hf_ratio`. `flux2d.py` implements exactly the protocol these arms need -- target
+views from the manifest, paired per scene, t, win count, PSNR + LPIPS + DSIM +
+hf_ratio, `render` as the control endpoint -- and it is what produced the FLUX
+baseline numbers, so using it keeps GeoFix and its 2D control on one scorer.
+(`score_arms` is not *wrong* on these directories, because it intersects arm and GT
+stems and only target frames are written here; it is just weaker.)
 
 ## The eval set comes from the MANIFEST, not from a glob
 
@@ -138,9 +146,9 @@ def main() -> int:
     ap.add_argument("--cond-artifact", action="store_true",
                     help="Fill latents_cond[:, cond_num:] with render features.")
     ap.add_argument("--mask-in-camera", action="store_true",
-                    help="Grade camera channel 0 by M_edit. MEASURED NOT TO TRAIN "
-                         "(2026-08-17) -- see src/utils/geofix_slots.py. Present so the "
-                         "arm is reproducible, not because it is recommended.")
+                    help="Grade camera channel 0 by M_edit. Trains, but only after "
+                         "~70 steps of LR warmup absorb the distribution shift -- see "
+                         "src/utils/geofix_slots.py before reading an early curve.")
     ap.add_argument("--gamma", type=float, default=1.0,
                     help="Contrast exponent on the pooled mask; must match training.")
     ap.add_argument("--seed", type=int, default=0,
@@ -194,12 +202,24 @@ def main() -> int:
             f"view protocol mismatch: context has num_views={v} cond_num={cond}, "
             f"manifest has {manifest['num_views']}/{manifest['cond_num']}.")
 
+    # `manifest["mask_pooling"]` is PROSE, not an enum -- it reads "MAX to 36x36,
+    # applied in the fork at load time (hard rule 6)". Passing it straight through
+    # raises in GeoFixPairs, which is the good outcome; the bad one would have been
+    # a field that happened to parse as the wrong mode. So the value is hard rule 6
+    # ("MAX, never MEAN") and the manifest string is CHECKED against it rather than
+    # read from.
+    pooling = "max"
+    if "max" not in str(manifest["mask_pooling"]).lower():
+        raise ValueError(
+            f"manifest mask_pooling is {manifest['mask_pooling']!r}, which does not "
+            f"mention MAX. Hard rule 6 requires max pooling to the token grid; a "
+            f"manifest built with mean pooling cannot be scored as if it were max.")
     dataset = GeoFixPairs(
         args.manifest,
         mask_types=list(manifest["mask_types"]),
         token_grid=ctx["token_grid"],
         gamma=args.gamma,
-        pooling=str(manifest["mask_pooling"]),
+        pooling=pooling,
         return_gt=True,
     )
     n = len(dataset) if args.limit is None else min(args.limit, len(dataset))
@@ -320,7 +340,8 @@ def main() -> int:
         "mask_in_camera": bool(args.mask_in_camera),
         "mask_types": list(manifest["mask_types"]),
         "mask_polarity": manifest["mask_polarity"],
-        "mask_pooling": manifest["mask_pooling"],
+        "mask_pooling": pooling,
+        "mask_pooling_manifest": manifest["mask_pooling"],
         "gamma": args.gamma,
         "num_views": v,
         "cond_num": cond,

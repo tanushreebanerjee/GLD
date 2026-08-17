@@ -33,25 +33,36 @@ here"), so this is the one mask in the project that enters with NO sign flip --
 hard rule 7 is satisfied by construction, and a flip added "to be safe" would be
 the bug.
 
-> **MEASURED 2026-08-17, AND IT DOES NOT TRAIN.** Jobs 7264903 (this slot on) vs
-> 7264904 (off), one config, `--geofix-no-mask` the only difference: with the mask
-> graded in, gradient norms ran 100-850 on EVERY step 0-22 with no downward trend
-> against `clip_grad: 1.0`, and train loss sat at 1.72 against 0.44 for slot 1
-> alone. Slot 1 is healthy; slot 2 is not.
+> **MEASURED 2026-08-17: it starts far off-distribution and then converges.** Jobs
+> 7264903 (this slot on) vs 7264904 (off), one config, `--geofix-no-mask` the only
+> difference, `clip_grad: 1.0`, linear warmup over 100 steps. Gradient norms in the
+> mask arm, binned by 10 steps as (count above 10, mean):
 >
-> The reason is not the one `docs/ARCH_NOTES.md` gives. ARCH_NOTES says channel 0
-> "saw a strict {0, 1} for all 175k iterations", which is true and insufficient:
-> the channel was also spatially **CONSTANT WITHIN EACH VIEW** -- one value per
-> frame, distinguishing reference from target. A mask makes it spatially varying
-> inside a view for the first time, so `camera_embedder.proj`'s 14x14 convolution
-> sees structure in a channel that was always flat. That is a much larger shift
-> than intermediate values alone.
+>     0-9   10/10  269.5      40-49  10/10   67.1
+>     10-19 10/10  212.9      50-59   9/10   30.3
+>     20-29 10/10  187.9      60-69   4/10   15.6
+>     30-39 10/10  128.1      70-79   1/10   12.0
 >
-> Kept here rather than deleted because it is the measured baseline the widening
-> route has to beat, and because "the shape was right" is exactly why it looked
-> safe. Prefer the zero-init widening route
-> (`stage2/models/mask_conditioning.py`): new channels, inert at initialisation,
-> mask delivered natively on the 36x36 grid with no 504 round-trip.
+> Train loss: 1.72 against slot 1's 0.44 at step 20; **0.3413 against 0.3184 at step
+> 130.** The gap closes and the warmup is load-bearing.
+>
+> **Do not read this curve before the warmup ends.** Steps 0-26 look like divergence
+> -- I called it that -- and they are not. Norms are only logged above
+> `clip_grad * 10`, so the warning *going quiet* is the pass signal: the absence of
+> output is the measurement, which reads exactly like an absence of data.
+>
+> **Why it starts that far out**, and this is where `docs/ARCH_NOTES.md` is
+> incomplete. ARCH_NOTES says channel 0 "saw a strict {0, 1} for all 175k
+> iterations" -- true and insufficient. The channel was also spatially **CONSTANT
+> WITHIN EACH VIEW**: one value per frame, distinguishing reference from target. A
+> mask makes it spatially varying inside a view for the first time, so
+> `camera_embedder.proj`'s 14x14 convolution sees structure in a channel that was
+> always flat. That accounts for the initial magnitude without implying the route is
+> unusable.
+>
+> The zero-init widening route (`stage2/models/mask_conditioning.py`, inertness gate
+> PASS 2026-08-11) remains the fallback for an arm that genuinely fails to absorb.
+> It was NOT needed here.
 """
 
 from __future__ import annotations
