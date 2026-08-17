@@ -1635,7 +1635,14 @@ def main(args):
                     # NEW: Feature Propagation Mode (Image 1 Architecture)
                     source_condition_level=source_condition_level,
                     source_condition_stat_path=source_condition_stat_path,
-                ) 
+                    # The same conditioning the training step uses. Passing these
+                    # is not optional once training uses them: validation builds
+                    # its own conditioning from scratch, so without them it scores
+                    # a GeoFix-trained model under stock GLD inputs, against the
+                    # RENDER rather than the clean frame. Finite, plotted, wrong.
+                    geofix_cond_artifact=geofix_cond_artifact,
+                    geofix_mask_in_camera=geofix_mask_in_camera,
+                )
                 # remove images from printed log
                 log_copy = {k: v for k, v in val_stats.items() if k != "val/images"}
                 if rank == 0:

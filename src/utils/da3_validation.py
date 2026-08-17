@@ -67,6 +67,9 @@ def validate_da3_multiview(
     # NEW: Feature Propagation Mode (Image 1 Architecture)
     source_condition_level=None,  # L1 features for encoder conditioning (not x0 init)
     source_condition_stat_path=None,  # Normalization stat path for source condition level
+    # GeoFix session 8: the same two conditioning slots `prepare_data` fills.
+    geofix_cond_artifact=False,  # fill cond_channel[:, cond_num:] with render features
+    geofix_mask_in_camera=False,  # grade camera channel 0 by M_edit on the target half
 ):
     """
     Shared validation/inference logic for DA3 MVDiffusion.
@@ -147,6 +150,32 @@ def validate_da3_multiview(
             extrinsic = batch['c2w'].to(device)
         else:
             raise ValueError("Batch must contain 'gt_inp', 'fxfycxcy', 'c2w' or 'image', 'extrinsic', 'intrinsic' keys")
+
+        # ------------------------------------------------------------------
+        # GeoFix: the SAME image-role swap the training loop performs, and it has
+        # to happen here too or validation measures a different task than
+        # training. Without it `images` is the 3DGS RENDER, so `latents_all` --
+        # which becomes both the flow target and the PSNR reference below -- is the
+        # render, and the logged val/psnr_tgt scores the model against the
+        # degraded input rather than against the clean photograph. The number
+        # would be finite, plotted, and meaningless, which is worse than absent.
+        # ------------------------------------------------------------------
+        geofix_artifact_images = None
+        geofix_mask = None
+        if geofix_cond_artifact:
+            if 'gt_clean' not in batch:
+                raise ValueError(
+                    "geofix_cond_artifact=True but the batch has no 'gt_clean'. "
+                    "Only the GeoFix loader supplies it; check dataset.name=geofix.")
+            geofix_artifact_images = images                      # the render -> cond slot
+            images = batch['gt_clean'].to(device)                # the clean frame -> target
+        if geofix_mask_in_camera:
+            if 'mask' not in batch:
+                raise ValueError(
+                    "geofix_mask_in_camera=True but the batch has no 'mask'. "
+                    "Only the GeoFix loader supplies it; check dataset.name=geofix.")
+            geofix_mask = batch['mask'].to(device)
+
         B, V, C, H, W = images.shape
         
         # Debug: Log batch resolution
@@ -208,6 +237,23 @@ def validate_da3_multiview(
         # Validation: first 'cond_num' views are condition.
         random_masks = torch.ones((B, V, 1, H, W), device=device, dtype=extrinsic.dtype)
         random_masks[:, :cond_num] = 0
+        # GeoFix slot 2, identical to `prepare_data`: grade the target half by
+        # M_edit instead of leaving it at a constant 1.0. Polarity already agrees
+        # (channel 0 = 1 means "target, generate it"; M_edit = 1 means "repair
+        # here"), so no flip -- hard rule 7 is satisfied by construction here, and
+        # a flip inserted "to be safe" would be the bug. Nearest, so one token maps
+        # to exactly one 14x14 patch; bilinear would smear values across patch
+        # boundaries and make the MAX pooling of hard rule 6 pointless.
+        if geofix_mask is not None:
+            if geofix_mask.ndim != 5 or geofix_mask.shape[:3] != (B, V, 1):
+                raise ValueError(
+                    f"geofix mask must be (B={B}, V={V}, 1, g, g), got "
+                    f"{tuple(geofix_mask.shape)}.")
+            m_img = torch.nn.functional.interpolate(
+                geofix_mask.reshape(B * V, 1, geofix_mask.shape[3], geofix_mask.shape[4]
+                                    ).to(dtype=random_masks.dtype),
+                size=(H, W), mode="nearest").reshape(B, V, 1, H, W)
+            random_masks[:, cond_num:] = m_img[:, cond_num:]
         random_masks = random_masks.reshape(B * V, 1, H, W)
 
         camera_embedding = torch.cat([random_masks, camera_embedding], dim=1)  # (B*V, 4 or 7, H, W)
@@ -267,6 +313,21 @@ def validate_da3_multiview(
         # 2. Diffusion Sampling
         # CRITICAL: Condition views start from GT, only target views get noise
         
+        # GeoFix slot 1: encode the render so the target half of the condition
+        # channel can carry it. ImageNet normalisation, matching `images_norm`
+        # above and `prepare_data` -- the encoder statistics are not optional
+        # (hard rule 5's calibration depends on this path being the same one).
+        geofix_latents_art = None
+        if geofix_artifact_images is not None:
+            if geofix_artifact_images.shape != images.shape:
+                raise ValueError(
+                    f"artifact images {tuple(geofix_artifact_images.shape)} must match "
+                    f"clean images {tuple(images.shape)}.")
+            with torch.no_grad():
+                art_norm = ((geofix_artifact_images.to(device, non_blocking=True)
+                             - rae.encoder_mean[None]) / rae.encoder_std[None])
+                geofix_latents_art = rae.encode(art_norm)
+
         # Encode GT images to get condition view latents
         with torch.no_grad():
             if predict_cls:
@@ -412,7 +473,14 @@ def validate_da3_multiview(
                 cond_channel = torch.zeros(B, V, latent_dim, h_lat, w_lat, device=device, dtype=gt_latents.dtype)
                 cond_channel[:, :cond_num] = latents_ref_5d  # Ref views get clean features
                 # Tgt views remain zeros
-                
+                # ...UNLESS GeoFix is on, in which case they carry the render. This
+                # is the slot session 6.5 never used: there the render reached the
+                # model only as a sampling-time overwrite of x_t, never as
+                # conditioning the network could read.
+                if geofix_latents_art is not None:
+                    cond_channel[:, cond_num:] = geofix_latents_art.reshape(
+                        B, V, latent_dim, h_lat, w_lat)[:, cond_num:].to(cond_channel.dtype)
+
                 # Concatenate: [cond_channel | noisy_part] along channel dim
                 sample_input = torch.cat([cond_channel, noisy_part], dim=2)  # (B, V, 2*C, h, w)
 
