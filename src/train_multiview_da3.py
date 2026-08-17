@@ -574,6 +574,17 @@ def main(args):
         print(f"Starting rank={rank}, seed={seed}, world_size={world_size}.")
 
     micro_batch_size = global_batch_size // (world_size * grad_accum_steps)
+    # global_batch_size is the total ACROSS accumulation, so this floor-divides to
+    # 0 whenever it is smaller than world_size * grad_accum_steps -- and the
+    # divisibility check that would have caught that is commented out just above.
+    # The failure then surfaces far away as "batch_size should be a positive
+    # integer value, but got batch_size=0" from the DataLoader.
+    if micro_batch_size < 1:
+        raise ValueError(
+            f"micro_batch_size = global_batch_size // (world_size * grad_accum_steps) "
+            f"= {global_batch_size} // ({world_size} * {grad_accum_steps}) = "
+            f"{micro_batch_size}. Raise training.global_batch_size to at least "
+            f"{world_size * grad_accum_steps}, or lower grad_accum_steps.")
     use_bf16 = args.precision == "bf16"
     if use_bf16 and not torch.cuda.is_bf16_supported():
         raise ValueError("Requested bf16 precision, but the current CUDA device does not support bfloat16.")

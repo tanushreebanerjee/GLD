@@ -109,10 +109,14 @@ training:
   camera_drop: 0.1
   global_seed: 0
   epochs: 1000000
-  # One 8-view sample per step at 504x504. The released run used 7 on 8xB200;
-  # a single A6000 (48G) does not have that headroom. Raise grad_accum_steps
-  # rather than global_batch_size if a larger effective batch is wanted.
-  global_batch_size: 1
+  # global_batch_size is the total ACROSS accumulation and gets floor-divided:
+  # micro_batch_size = global_batch_size // (world_size * grad_accum_steps).
+  # So 4 // (1 * 4) = 1 sample of 8 views per forward at 504x504, accumulated 4x
+  # for an effective batch of 4 samples / 32 views. Setting this to 1 yields
+  # micro_batch_size 0 and a DataLoader crash.
+  # The released run used 7 on 8xB200; one A6000 (48G) has nothing like that
+  # headroom, so the depth comes from accumulation instead.
+  global_batch_size: 4
   grad_accum_steps: 4
   ema_decay: 0.9995
   num_workers: 4
