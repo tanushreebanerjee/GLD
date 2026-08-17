@@ -621,6 +621,66 @@ def create_multiview_dataloader(
             image_size=image_size,
             cond_num=cond_num,
         )
+    # GeoFix: 3DGS artifact renders + uncertainty masks, driven by a manifest
+    # rather than by video/pose roots. Returns early because it needs its own
+    # collate_fn -- it yields CUT3R's list-of-per-view-dicts, which the shared
+    # tail's default collate would stack along the wrong axis.
+    elif dataset_name.lower() == "geofix":
+        from video.geofix_pairs import GeoFixPairs, collate, assert_view_config
+        import json as _json
+
+        # `video_path`/`pose_path` mean nothing here, so the train/val split is
+        # carried by two explicit manifests. Without `val_manifest` a validation
+        # loader would silently re-open the TRAINING manifest and report val
+        # metrics measured on training data.
+        manifest = dataset_kwargs.get("manifest")
+        if mode == "test":
+            manifest = dataset_kwargs.get("val_manifest")
+            if manifest is None:
+                raise ValueError(
+                    "dataset.val_manifest is required for dataset_name='geofix' when "
+                    "a validation loader is built; otherwise validation would run on "
+                    "the training manifest. Point it at the held-out eval manifest."
+                )
+        if manifest is None:
+            raise ValueError(
+                "dataset.manifest is required for dataset_name='geofix' "
+                "(e.g. eval/train/manifest_masked_exclude.json)."
+            )
+        # The manifest is the authority on view layout: it PLACED the clean
+        # references in [0, cond_num). If the training config disagrees, the
+        # references are not where the model is told they are.
+        assert_view_config(ref_view_sampling, cond_num, _json.load(open(manifest)))
+
+        dataset = GeoFixPairs(
+            manifest,
+            mask_types=dataset_kwargs.get("mask_types"),
+            token_grid=int(dataset_kwargs.get("token_grid", 36)),
+            gamma=float(dataset_kwargs.get("gamma", 1.0)),
+            pooling=str(dataset_kwargs.get("pooling", "max")),
+            return_gt=True,
+        )
+        if len(dataset) == 0:
+            raise ValueError(f"GeoFix manifest {manifest} yielded 0 samples.")
+        print(f"[INFO] GeoFix dataset: {len(dataset)} samples from {manifest}")
+
+        if overfit:
+            steps = desired_steps if desired_steps is not None else 10
+            dataset = Subset(dataset, [0] * (steps * batch_size * world_size))
+
+        sampler = DistributedSampler(
+            dataset, num_replicas=world_size, rank=rank, shuffle=shuffle
+        )
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            sampler=sampler,
+            num_workers=workers,
+            pin_memory=True,
+            drop_last=True,
+            collate_fn=collate,
+        )
+        return loader, sampler
     # Handle CUT3R datasets (lazy import)
     elif dataset_name.lower() in CUT3R_DATASETS:
         try:

@@ -63,11 +63,13 @@ from utils.camera.camera import get_camera_embedding
 from datetime import datetime
 
 def prepare_data(
-    rae, images, intrinsic, extrinsic, device, 
-    random_cond_num: int = 1, 
-    return_cls: bool = False, 
+    rae, images, intrinsic, extrinsic, device,
+    random_cond_num: int = 1,
+    return_cls: bool = False,
     camera_mode: str = "camray",
-    return_scale: bool = False
+    return_scale: bool = False,
+    artifact_images=None,
+    geofix_mask=None,
 ):
     """
     Prepare data for training.
@@ -75,6 +77,20 @@ def prepare_data(
     Args:
         camera_mode: "camray" for direction only (3ch), "plucker" for [d, o×d] (6ch)
         return_scale: Whether to return the translation normalization scale factor.
+
+    GeoFix (both arguments optional; unset reproduces stock GLD exactly):
+
+        artifact_images: (B, V, 3, H, W) 3DGS renders. Fills
+            `latents_cond[:, cond_num:]`, which stock GLD leaves as ZEROS -- so
+            without this the degraded render never enters the network at all and
+            there is nothing to refine. `images` must then be the CLEAN frames,
+            because `latents_all` is the flow TARGET. Two encodes, deliberately:
+            the model is conditioned on the artifact and supervised toward clean.
+
+        geofix_mask: (B, V, 1, g, g) `edit1` mask on the token grid, 1 = "repair
+            here". Replaces the constant 1.0 that target views carry in camera
+            channel 0. Nearest-upsampled to (H, W) so each token maps onto its own
+            14x14 patch and survives the camera_embedder's patchify exactly.
     """
     # B, V, C, H, W = images.shape # Removed resize logic as per user request
     B, V, C, H, W = images.shape
@@ -124,7 +140,28 @@ def prepare_data(
                 latents_ref = rae.encode(images_norm[:, :cond_views])
         else:
             latents_ref = None
-            
+
+        # B2. GeoFix: encode the ARTIFACT renders, per view, for the target slots.
+        # `mode='single'`-equivalent framing does not apply here: we deliberately
+        # encode them the same way `latents_all` is encoded, so the conditioning
+        # and the target live in the same normalized space.
+        latents_art = None
+        if artifact_images is not None:
+            if artifact_images.shape != images.shape:
+                raise ValueError(
+                    f"artifact_images {tuple(artifact_images.shape)} must match "
+                    f"images {tuple(images.shape)}.")
+            art_norm = (artifact_images.to(device, non_blocking=True)
+                        - rae.encoder_mean[None]) / rae.encoder_std[None]
+            if return_cls:
+                latents_art, cls_art = rae.encode(art_norm, return_cls=True)
+                BVa, C_a, h_a, w_a = latents_art.shape
+                latents_art = torch.cat(
+                    [cls_art.reshape(BVa, C_a, 1, 1),
+                     latents_art.reshape(BVa, C_a, h_a * w_a, 1)], dim=2)
+            else:
+                latents_art = rae.encode(art_norm)
+
         # C. Merge: Reference part from 'ref-only' pass, Target part from 'all' pass
     # latents_all is (B*V, C, ...)
     BV = latents_all.shape[0]
@@ -199,6 +236,30 @@ def prepare_data(
         )
     random_masks = torch.ones((B, V, 1, H, W), device=device, dtype=latents_all.dtype)
     random_masks[:, :cond_views] = 0
+    # GeoFix slot 2: grade the target half by M_edit instead of a constant 1.0.
+    # Polarity already agrees -- channel 0 = 1 means "this is a target, generate
+    # it", M_edit = 1 means "repair here" -- so this enters with NO sign flip,
+    # the only mask in the project that does (hard rule 7).
+    #
+    # NOTE the semantic overload this creates, because it bounds what slot 2 can
+    # do alone: a target token driven to 0 now looks like a REFERENCE token, but
+    # reference views also carry real content in `latents_cond` while target
+    # views carry zeros unless slot 1 is on. Slot 2 alone therefore says
+    # "preserve" while supplying nothing to preserve. The slots are
+    # complementary, not alternatives, and `mask_only` exists to measure that
+    # rather than to be deployed.
+    if geofix_mask is not None:
+        m = geofix_mask.to(device=device, dtype=latents_all.dtype)
+        if m.ndim != 5 or m.shape[0] != B or m.shape[1] != V or m.shape[2] != 1:
+            raise ValueError(
+                f"geofix_mask must be (B={B}, V={V}, 1, g, g), got {tuple(m.shape)}.")
+        # Nearest, so one token -> exactly one 14x14 patch. Bilinear would blur
+        # values across patch boundaries and MAX pooling (hard rule 6) would then
+        # have been pointless.
+        m_img = torch.nn.functional.interpolate(
+            m.reshape(B * V, 1, m.shape[3], m.shape[4]), size=(H, W), mode="nearest"
+        ).reshape(B, V, 1, H, W)
+        random_masks[:, cond_views:] = m_img[:, cond_views:]
     random_masks = random_masks.reshape(B * V, 1, H, W)
 
     camera_embedding = torch.cat([random_masks, camera_embedding], dim=1)  # (B*V, 7, H, W)
@@ -216,6 +277,10 @@ def prepare_data(
         if latents_ref is not None:
             latents_ref_5d = latents_ref.reshape(B, cond_views, C_lat, seq_len, 1)
             latents_cond_5d[:, :cond_views] = latents_ref_5d
+        # GeoFix slot 1: the target half stops being zeros and carries the render.
+        if latents_art is not None:
+            latents_cond_5d[:, cond_views:] = latents_art.reshape(
+                B, V, C_lat, seq_len, 1)[:, cond_views:]
         latents_cond = latents_cond_5d.reshape(BV, C_lat, seq_len, 1)
     else:
         # Spatial format: (BV, C, h, w)
@@ -224,6 +289,10 @@ def prepare_data(
         if latents_ref is not None:
             latents_ref_5d = latents_ref.reshape(B, cond_views, C_lat, h_lat, w_lat)
             latents_cond_5d[:, :cond_views] = latents_ref_5d
+        # GeoFix slot 1: the target half stops being zeros and carries the render.
+        if latents_art is not None:
+            latents_cond_5d[:, cond_views:] = latents_art.reshape(
+                B, V, C_lat, h_lat, w_lat)[:, cond_views:]
         latents_cond = latents_cond_5d.reshape(BV, C_lat, h_lat, w_lat)
 
     return latents_cond, latents_all, camera_embedding
@@ -418,6 +487,23 @@ def main(args):
     camera_mode = multiview_cfg.get("camera_mode", dataset_cfg.get("camera_mode", "camray")).lower()
     if camera_mode not in {"camray", "plucker"}:
         raise ValueError(f"Unknown camera_mode={camera_mode}. Use 'camray' or 'plucker'.")
+
+    # ----------------------------------------------------------------------
+    # GeoFix: the two conditioning slots that already exist in this checkpoint
+    # (docs/ARCH_NOTES.md "two conditioning slots ... need no widening").
+    # Both default OFF, so every stock GLD config trains exactly as before.
+    #   cond_artifact  -> fill latents_cond[:, cond_num:] with render features
+    #   mask_in_camera -> grade camera channel 0 by M_edit on the target half
+    # The ablation ladder is these two booleans, one code path, so the rows are
+    # comparable (docs/SESSION_8.md deliverable 2).
+    # ----------------------------------------------------------------------
+    geofix_cfg = cfg.get("geofix", {}) or {}
+    geofix_cond_artifact = bool(geofix_cfg.get("cond_artifact", False))
+    geofix_mask_in_camera = bool(geofix_cfg.get("mask_in_camera", False))
+    if (geofix_cond_artifact or geofix_mask_in_camera) and dataset_name.lower() != "geofix":
+        raise ValueError(
+            f"geofix.* conditioning is on but dataset.name={dataset_name!r}. "
+            "Only the GeoFix loader supplies 'gt_clean' and 'mask'.")
     # All datasets must provide OpenCV c2w at load time
     # Feature-to-Feature Flow Matching: Optional source level conditioning
     # source_level: If set, use features from this level (+ noise) as x0 instead of pure noise
@@ -566,6 +652,8 @@ def main(args):
     model_config.params.cam_in_channels = cam_in_channels
     if rank == 0:
         logger.info(f"Camera mode: {camera_mode}, cam_in_channels: {cam_in_channels}")
+        logger.info(f"[GeoFix] cond_artifact={geofix_cond_artifact} "
+                    f"mask_in_camera={geofix_mask_in_camera}")
 
     rae = instantiate_from_config(rae_config).to(device)
 
@@ -585,9 +673,26 @@ def main(args):
     train_steps = 0
     ckpt_meta = None
 
-    if args.pretrained is not None: 
+    if args.pretrained is not None:
         checkpoint = torch.load(args.pretrained, map_location="cpu")
-        state_dict = checkpoint["model"] if "model" in checkpoint else checkpoint
+        # The RELEASED GLD checkpoints (SeonghuJeon/GLD, e.g. da3_level1.pt) ship
+        # EMA weights only -- their single top-level key is "ema", with no "model".
+        # The original `checkpoint["model"] if "model" in checkpoint else checkpoint`
+        # then hands the whole {"ema": OrderedDict} down as if it were a state dict
+        # and dies on `.to(bfloat16)`. Handled explicitly rather than by widening
+        # the fallback, so an unrecognised layout still fails loudly instead of
+        # silently loading nothing under strict=False.
+        if "model" in checkpoint:
+            state_dict = checkpoint["model"]
+        elif "ema" in checkpoint:
+            state_dict = checkpoint["ema"]
+            print("[pretrained] loading EMA weights (released GLD layout).")
+        else:
+            state_dict = checkpoint
+        if not all(torch.is_tensor(v) for v in state_dict.values()):
+            raise ValueError(
+                f"{args.pretrained}: expected a flat tensor state dict, got keys "
+                f"{list(state_dict)[:5]}. Unrecognised checkpoint layout.")
         state_dict = {
             k: v for k, v in state_dict.items()
             if not k.startswith("y_embedder.")
@@ -595,6 +700,17 @@ def main(args):
         for k in state_dict:
             state_dict[k] = state_dict[k].to(torch.bfloat16)
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        # A finetune that silently loaded nothing is a from-scratch run wearing a
+        # finetune's name, which hard rule 2 exists to prevent. `strict=False` is
+        # kept (y_embedder is deliberately dropped) but the damage is bounded.
+        if len(missing) > 20 or len(unexpected) > 20:
+            raise ValueError(
+                f"{args.pretrained}: {len(missing)} missing / {len(unexpected)} "
+                f"unexpected keys -- this is not the architecture the checkpoint "
+                f"was trained for. missing[:5]={missing[:5]} "
+                f"unexpected[:5]={unexpected[:5]}")
+        print(f"[pretrained] loaded {len(state_dict)} tensors; "
+              f"{len(missing)} missing, {len(unexpected)} unexpected.")
     if args.ckpt is not None:
         checkpoint = torch.load(args.ckpt, map_location="cpu")
         ckpt_meta = checkpoint
@@ -859,7 +975,10 @@ def main(args):
     #     model_fn = ema.forward
 
     logger.info(f"Training for {num_epochs} epochs...")
+    stop_training = False
     for epoch in range(start_epoch, num_epochs):
+        if stop_training:
+            break
         model.train()
         
         # Fast resume: compute batches to skip for this epoch
@@ -923,10 +1042,36 @@ def main(args):
                 batch = convert_cut3r_batch(batch, batch_cond_num, ref_view_sampling)
             
             # image_dict, dict_keys(['enc_inp', 'gt_inp', 'fxfycxcy_252', 'c2w', 'video_id', 'frame_indices'])
-            image = batch['gt_inp'] 
-            
+            image = batch['gt_inp']
+
             intrinsic = batch['fxfycxcy']
             extrinsic = batch['c2w']
+
+            # ------------------------------------------------------------------
+            # GeoFix conditioning. Both slots are off by default, so a stock GLD
+            # run is byte-for-byte unaffected by any of this.
+            #
+            # `gt_inp` from the GeoFix loader is the ARTIFACT render and
+            # `gt_clean` is the clean photograph. The flow target must be CLEAN
+            # (that is what we supervise toward), so when slot 1 is on the two
+            # swap roles: `image` becomes the clean frame and the render is
+            # handed to prepare_data separately as conditioning.
+            # ------------------------------------------------------------------
+            artifact_images = None
+            geofix_mask = None
+            if geofix_cond_artifact:
+                if 'gt_clean' not in batch:
+                    raise ValueError(
+                        "geofix.cond_artifact=true but the batch has no 'gt_clean'. "
+                        "Only the GeoFix loader supplies it; check dataset.name=geofix.")
+                artifact_images = image      # the render, -> latents_cond target slots
+                image = batch['gt_clean']    # the clean frame, -> flow target
+            if geofix_mask_in_camera:
+                if 'mask' not in batch:
+                    raise ValueError(
+                        "geofix.mask_in_camera=true but the batch has no 'mask'. "
+                        "Only the GeoFix loader supplies it; check dataset.name=geofix.")
+                geofix_mask = batch['mask']
 
             # ------------------------------------------------------------------
             # Fail loudly on view-count mismatches (critical for multiview runs)
@@ -961,15 +1106,17 @@ def main(args):
             if predict_cls:
                 # For now, following user's strict return signature.
                 x1_cond, x1_all, camera_embedding = prepare_data(
-                    rae, image, intrinsic, extrinsic, device, 
-                    random_cond_num=batch_cond_num, return_cls=True, 
-                    camera_mode=camera_mode, return_scale=use_prope
+                    rae, image, intrinsic, extrinsic, device,
+                    random_cond_num=batch_cond_num, return_cls=True,
+                    camera_mode=camera_mode, return_scale=use_prope,
+                    artifact_images=artifact_images, geofix_mask=geofix_mask
                 )
             else:
                 x1_cond, x1_all, camera_embedding = prepare_data(
-                    rae, image, intrinsic, extrinsic, device, 
+                    rae, image, intrinsic, extrinsic, device,
                     random_cond_num=batch_cond_num, return_cls=False,
-                    camera_mode=camera_mode, return_scale=use_prope
+                    camera_mode=camera_mode, return_scale=use_prope,
+                    artifact_images=artifact_images, geofix_mask=geofix_mask
                 )
             
             # Ensure cond_num is set to actual sampled value for model_kwargs
@@ -1310,6 +1457,28 @@ def main(args):
             step_ref_loss_accum = 0.0
             step_tgt_loss_accum = 0.0
 
+            # Smoke-test bound (GeoFix). `epochs` cannot express "10 steps", and a
+            # smoke run that has to be killed by hand never proves checkpointing
+            # works -- which is half of what the smoke test is for.
+            if args.max_steps is not None and train_steps >= int(args.max_steps):
+                if rank == 0:
+                    logger.info(f"[max_steps] reached {train_steps}; saving and stopping.")
+                    checkpoint = {
+                        "model": model.module.state_dict(),
+                        "ema": ema.state_dict(),
+                        "opt": opt.state_dict(),
+                        "scheduler": schedl.state_dict(),
+                        "args": vars(args),
+                        "train_steps": train_steps,
+                    }
+                    os.makedirs(checkpoint_dir, exist_ok=True)
+                    torch.save(checkpoint, f"{checkpoint_dir}/{train_steps:07d}.pt")
+                    logger.info(f"Saved checkpoint to {checkpoint_dir}/{train_steps:07d}.pt")
+                if dist.is_available() and dist.is_initialized():
+                    dist.barrier()
+                stop_training = True
+                break
+
             # Delay WandB initialization to avoid clutter from failed starts
             # Use >= 5 instead of == 5 to handle resume from checkpoint
             if not wandb_initialized and train_steps >= 0:
@@ -1477,6 +1646,9 @@ if __name__ == "__main__":
     parser.add_argument("--vae-type", type=str, default="RAE", help="VAE type: RAE or VAE")
     parser.add_argument("--ckpt", type=str, default=None, help="Resume from checkpoint (model+ema+opt)")
     parser.add_argument("--git-hash", type=str, default=None, help="Git hash for current run")
+    parser.add_argument("--max-steps", type=int, default=None,
+                        help="Stop after N optimizer steps, saving a checkpoint first. "
+                             "For smoke tests (GeoFix: 'smoke test before every real run').")
 
     args = parser.parse_args()
     # Log level info
