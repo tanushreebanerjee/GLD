@@ -23,6 +23,7 @@ from copy import deepcopy
 from glob import glob
 from time import time
 import argparse
+import itertools
 import logging
 import sys
 
@@ -900,10 +901,29 @@ def main(args):
     )
     logger.info(f"Precision mode: {args.precision}")
     loader_batches = len(loader)
-    if loader_batches % grad_accum_steps != 0:
-        # raise ValueError("Number of loader batches must be divisible by grad_accum_steps when drop_last=True.")
-        logger.warning("Number of loader batches must be divisible by grad_accum_steps when drop_last=True.")
     steps_per_epoch = loader_batches // grad_accum_steps
+    # The ragged tail is DROPPED, and the epoch stops after a whole number of
+    # optimizer steps. Before this, an indivisible loader length was a warning here
+    # and a hard crash an hour later -- `RuntimeError: Gradient accumulation counter
+    # not zero at epoch end` at line ~1661, which is the same fact discovered far
+    # from its cause. It cost job 7264790 after 269 of 269 iterations.
+    #
+    # Dropping is the right resolution rather than demanding divisibility: GeoFix's
+    # masked manifest is 269 samples and 269 is PRIME, so no grad_accum_steps above
+    # 1 divides it and no config value could satisfy the check. The alternative --
+    # stepping the optimizer on a partial accumulation -- would make one step per
+    # epoch carry a different effective batch size than every other step, silently.
+    #
+    # `drop_last=True` on the loader already discards a ragged tail for the same
+    # reason one level down; this is the same policy at the accumulation level.
+    micro_batches_per_epoch = steps_per_epoch * grad_accum_steps
+    if loader_batches != micro_batches_per_epoch and rank == 0:
+        logger.warning(
+            f"Dropping the ragged tail: {loader_batches} loader batches is not a "
+            f"multiple of grad_accum_steps={grad_accum_steps}, so each epoch "
+            f"consumes {micro_batches_per_epoch} and skips the last "
+            f"{loader_batches - micro_batches_per_epoch}. Shuffling reshuffles "
+            f"which samples land in the tail, so nothing is permanently unseen.")
     if steps_per_epoch <= 0:
         raise ValueError("Gradient accumulation configuration results in zero optimizer steps per epoch.")
     schedl, sched_msg = build_scheduler(opt, steps_per_epoch, training_cfg, sched_state)
@@ -1062,6 +1082,13 @@ def main(args):
         
         # Clear skip count after first epoch
         micro_batches_to_skip = 0
+
+        # Stop at a whole number of optimizer steps, dropping the ragged tail (see
+        # `micro_batches_per_epoch` above). Counted from what this epoch will
+        # actually consume, so a resumed epoch that already skipped
+        # `batches_to_skip_this_epoch` still ends on the same boundary.
+        pbar_iter = itertools.islice(
+            pbar_iter, max(micro_batches_per_epoch - batches_to_skip_this_epoch, 0))
 
         for batch in pbar_iter:
             # Dynamic cond_num: sample per batch if range was specified
@@ -1659,7 +1686,18 @@ def main(args):
                 dist.barrier()
 
         if accum_counter != 0:
-            raise RuntimeError("Gradient accumulation counter not zero at epoch end.")
+            # Kept as a genuine invariant assert. The islice above makes the epoch
+            # end on an optimizer-step boundary, so reaching this now means
+            # something ELSE ended the epoch early -- an exception swallowed inside
+            # the loop, or a `break` added without draining the accumulation. The
+            # ragged-tail case that used to land here is handled at the source.
+            raise RuntimeError(
+                f"Gradient accumulation counter is {accum_counter}, expected 0 at "
+                f"epoch end (grad_accum_steps={grad_accum_steps}, "
+                f"micro_batches_per_epoch={micro_batches_per_epoch}). The epoch "
+                "ended mid-accumulation, which the islice bound should prevent; "
+                "look for an early exit inside the training loop, not for an "
+                "indivisible loader length.")
 
     model.eval()
     logger.info("Done!")
