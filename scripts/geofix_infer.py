@@ -154,6 +154,14 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=0,
                     help="Fixed across arms so xT is identical and the comparison is paired.")
     ap.add_argument("--limit", type=int, default=None, help="Smoke: first N samples only.")
+    ap.add_argument("--shard", type=int, default=0)
+    ap.add_argument("--num-shards", type=int, default=1,
+                    help="Slice samples [shard::num_shards]. Needed, not merely "
+                         "faster: one arm is ~6.5h unsharded and the full grid of "
+                         "3 arms x 3 checkpoints is ~58h. Shards write disjoint "
+                         "split directories and per-shard provenance, and the "
+                         "per-sample seed keys off the GLOBAL index so an 8-shard "
+                         "run reproduces a 1-shard run exactly.")
     ap.add_argument("--dump-render", action="store_true",
                     help="Also write the unrefined render as a sibling arm. The "
                          "artifact endpoint is a REQUIRED control on this data (arm A "
@@ -223,11 +231,26 @@ def main() -> int:
         return_gt=True,
     )
     n = len(dataset) if args.limit is None else min(args.limit, len(dataset))
+    # Sharding, and the GLOBAL index is what survives it. `indices` holds the real
+    # dataset positions, so the per-sample seed below stays `seed + global_i` and a
+    # sample lands on the same xT no matter which shard drew it. Keying the seed off
+    # a shard-local counter would silently make an 8-shard run a different
+    # experiment from a 1-shard run -- and the images would look perfectly fine.
+    #
+    # --limit is applied FIRST, so `--limit 8 --num-shards 4` is a four-way smoke
+    # over 8 samples rather than four shards of the whole set (the same convention
+    # geofix.score_arms uses).
+    indices = list(range(n))
+    if args.num_shards > 1:
+        if not 0 <= args.shard < args.num_shards:
+            raise ValueError(f"shard {args.shard} out of range for "
+                             f"num_shards {args.num_shards}.")
+        indices = indices[args.shard::args.num_shards]
     out_root = pathlib.Path(args.out)
     render_root = out_root.parent / f"{out_root.name}__render" if args.dump_render else None
-    print(f"[infer] {n} samples, {v} views, cond_num={cond}, "
-          f"cond_artifact={args.cond_artifact} mask_in_camera={args.mask_in_camera}",
-          flush=True)
+    print(f"[infer] {len(indices)} of {n} samples (shard {args.shard}/{args.num_shards}), "
+          f"{v} views, cond_num={cond}, cond_artifact={args.cond_artifact} "
+          f"mask_in_camera={args.mask_in_camera}", flush=True)
 
     from utils.da3_validation_metric import get_denoised_features, decode_into_images
     from eval_gld_metric import get_cascade_features
@@ -236,7 +259,7 @@ def main() -> int:
     written = 0
     t_start = time.time()
 
-    for i in range(n):
+    for done, i in enumerate(indices):
         sample = dataset.samples[i]
         split = sample["split"]                     # already "K_06/<scene>__run_XXX__it_YYYYY"
         stems = list(sample["targets"])
@@ -323,15 +346,18 @@ def main() -> int:
             for k, stem in enumerate(stems):
                 Image.fromarray(to_uint8(batch["image"][0, cond + k])).save(dr / f"{stem}.png")
 
-        if (i + 1) % 10 == 0 or i + 1 == n:
+        if (done + 1) % 10 == 0 or done + 1 == len(indices):
             el = time.time() - t_start
-            print(f"[infer] {i + 1}/{n} samples, {written} frames, "
-                  f"{el / (i + 1):.1f}s/sample, eta {(n - i - 1) * el / (i + 1) / 60:.1f}min",
+            print(f"[infer] {done + 1}/{len(indices)} samples, {written} frames, "
+                  f"{el / (done + 1):.1f}s/sample, eta {(len(indices) - done - 1) * el / (done + 1) / 60:.1f}min",
                   flush=True)
 
     prov = {
         "manifest": str(args.manifest),
-        "n_samples": n,
+        "n_samples": len(indices),
+        "n_samples_total": n,
+        "shard": args.shard,
+        "num_shards": args.num_shards,
         "n_frames": written,
         "checkpoint_level1": str(args.checkpoint_level1),
         "checkpoint_cascade": str(args.checkpoint_cascade),
@@ -353,9 +379,10 @@ def main() -> int:
         "command": " ".join(sys.argv),
     }
     out_root.mkdir(parents=True, exist_ok=True)
-    (out_root / "_provenance.json").write_text(json.dumps(prov, indent=2))
+    (out_root / (f"_provenance.shard{args.shard}.json" if args.num_shards > 1 else "_provenance.json")).write_text(json.dumps(prov, indent=2))
     print(f"[infer] done: {written} frames from {n} samples -> {out_root}", flush=True)
-    print(f"[infer] score with: python -m geofix.score_arms --arm geofix={out_root} ...",
+    print(f"[infer] score with: python -m geofix.baselines.flux2d --mode score "
+          f"--manifest {args.manifest} --arm render --arm this={out_root} ...",
           flush=True)
     return 0
 
