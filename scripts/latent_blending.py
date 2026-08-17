@@ -651,12 +651,19 @@ def _payload_for(data, i: int, sample: dict, arm: str, device):
     return {**sample, "mask": mask}, mask
 
 
-def _dump(img_dir, i, arm, blend_at, rgb, sample, cond_num):
-    """Write one decoded target view per arm, plus the artifact and GT once.
+def _dump(img_dir, i, arm, blend_at, rgb, sample, cond_num, all_views=False, total_view=None):
+    """Write decoded target views per arm, plus the artifact and GT once.
 
-    The FIRST TARGET view (index `cond_num`), not view 0: views below `cond_num`
-    are references the blend never touches, so dumping one of those would show
-    every arm producing an identical picture and prove nothing.
+    By default the FIRST TARGET view (index `cond_num`), not view 0: views below
+    `cond_num` are references the blend never touches, so dumping one of those
+    would show every arm producing an identical picture and prove nothing.
+
+    `all_views=True` writes EVERY target view `[cond_num, total_view)` with a
+    `_v{k}` suffix. That is what `geofix.blend.optimal_mask` consumes: the
+    pointwise-optimal selector needs the generated output wherever it is going to
+    decide, which is all four scored views, not the one the sanity sheet draws.
+    The single-view names are left exactly as they were so existing figures keep
+    reproducing.
     """
     from PIL import Image
 
@@ -669,6 +676,14 @@ def _dump(img_dir, i, arm, blend_at, rgb, sample, cond_num):
     if not art.exists():
         _save(art.name, sample["image"][0][cond_num])
         _save(f"s{i:03d}__ab_gt.png", sample["gt"][0][cond_num])
+
+    if all_views:
+        for k in range(cond_num, int(total_view)):
+            _save(f"s{i:03d}__{arm}_{blend_at}__v{k}.png", rgb[k])
+            a = img_dir / f"s{i:03d}__aa_artifact__v{k}.png"
+            if not a.exists():
+                _save(a.name, sample["image"][0][k])
+                _save(f"s{i:03d}__ab_gt__v{k}.png", sample["gt"][0][k])
 
 
 def build_context(args, device) -> dict:
@@ -889,6 +904,7 @@ def build_context(args, device) -> dict:
         "clean_refs": bool(args.clean_refs),
         "img2img_t": args.img2img_t,
         "img2img_steps": args.img2img_steps,
+        "dump_all_views": bool(args.dump_all_views),
     }
 
 
@@ -943,6 +959,11 @@ def main() -> int:
                          "geofix.blend.visualise can build the side-by-side sheet. "
                          "A number that moves without a visible change is worth "
                          "distrusting, and vice versa.")
+    ap.add_argument("--dump-all-views", action="store_true",
+                    help="with --dump-images, also write every target view as "
+                         "`__v{k}.png`. Needed by geofix.blend.optimal_mask, which "
+                         "builds the pointwise-optimal selector and therefore needs "
+                         "the generated output at every scored view.")
     ap.add_argument("--smoke", action="store_true",
                     help="hook validation on one sample, then stop")
     ap.add_argument("--skip-hook-validation", action="store_true",
@@ -1065,7 +1086,9 @@ def main() -> int:
             res = run_sample(ctx, payload, arm, blend_at, seed)
             m = score_views(res["rgb"].to(device), gt, region, ctx)
             if i < args.dump_images:
-                _dump(img_dir, i, arm, blend_at, res["rgb"], sample, ctx["cond_num"])
+                _dump(img_dir, i, arm, blend_at, res["rgb"], sample, ctx["cond_num"],
+                      all_views=bool(ctx.get("dump_all_views")),
+                      total_view=ctx["num_views"])
             rows.append({
                 "scene": scene, "split": sample["split"], "sample": i,
                 "arm": arm, "blend_at": blend_at,
