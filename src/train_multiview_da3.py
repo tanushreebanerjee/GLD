@@ -441,6 +441,15 @@ def main(args):
     # training config parameters
     global_batch_size = int(training_cfg.get("global_batch_size", 256))
     grad_accum_steps = int(training_cfg.get("grad_accum_steps", 1))
+    # Overridden from the command line so ONE config can run on both the 48G A6000
+    # and the 141G H200 without a second copy that could drift in some other key.
+    # These change only how the same effective batch is split across steps and
+    # devices, never what the batch IS -- keep global_batch_size fixed across arms
+    # or the arms are not comparable.
+    if getattr(args, "global_batch_size", None) is not None:
+        global_batch_size = int(args.global_batch_size)
+    if getattr(args, "grad_accum_steps", None) is not None:
+        grad_accum_steps = int(args.grad_accum_steps)
     num_epochs = int(training_cfg.get("epochs", 100))
     ema_decay = float(training_cfg.get("ema_decay", 0.9999))
     num_workers = int(training_cfg.get("num_workers", 4))
@@ -1675,6 +1684,13 @@ if __name__ == "__main__":
     parser.add_argument("--max-steps", type=int, default=None,
                         help="Stop after N optimizer steps, saving a checkpoint first. "
                              "For smoke tests (GeoFix: 'smoke test before every real run').")
+    parser.add_argument("--global-batch-size", type=int, default=None,
+                        help="Override training.global_batch_size. For running one "
+                             "config on GPUs with different memory; hold it FIXED "
+                             "across ablation arms.")
+    parser.add_argument("--grad-accum-steps", type=int, default=None,
+                        help="Override training.grad_accum_steps. Changes only how "
+                             "the effective batch is split, not its size.")
     parser.add_argument("--geofix-no-mask", action="store_true",
                         help="Force geofix.mask_in_camera off, leaving cond_artifact "
                              "as configured. This is the GeoFix ablation arm -- "
