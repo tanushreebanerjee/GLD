@@ -129,19 +129,62 @@ training:
   final_lr: 1e-5
   beta: [0.9, 0.95]
   wd: 0.0
+  # INERT -- kept only because the released config carries it. `build_scheduler`
+  # reads `training.scheduler.type`, never `training.schedule_type`, so the block
+  # below is what is actually in force.
   schedule_type: 'constant'
   clip_grad: 1.0
 
+  # LR WARMUP -- added after the smoke test measured gradient norms of 178, 289
+  # and 985 on steps 1-3, against clip_grad 1.0. Every early step was therefore
+  # clipped to unit norm, which makes the effective learning rate a function of
+  # the gradient's direction only and the configured 1e-5 close to meaningless.
+  #
+  # This is the predicted cost of the no-surgery route, not a bug:
+  # docs/ARCH_NOTES.md, "the checkpoint saw zeros in slot 1 and a strict {0, 1}
+  # in slot 2 for all 175k iterations". Both slots now carry values it has never
+  # seen, so the first gradients are large by construction. Warmup lets the
+  # network absorb that before the LR reaches full size, rather than taking a
+  # few violently clipped steps at the start and calling it a finetune.
+  #
+  # Watch the logged norms: if they do not fall well below 10 within the warmup,
+  # the conditioning is too far off-distribution and the answer is the zero-init
+  # widening route, not a smaller LR.
+  # base_lr == final_lr makes `final_ratio` 1.0, and with no `decay_end_steps` the
+  # decay window collapses onto the warmup, so the shape is: linear ramp 0 -> 1e-5
+  # over 100 steps, then flat 1e-5 forever. No decay, deliberately -- a decaying
+  # LR on an open-ended finetune would make "the final step" mean something
+  # different depending on when the job happened to stop.
+  scheduler:
+    type: 'linear'
+    warmup_steps: 100
+    base_lr: 1e-5
+    final_lr: 1e-5
+
 validation:
-  # 194 held-out samples at batch 1. Validation here is a training-time sanity
-  # signal only -- the REPORTED holdout numbers come from a separate scoring
-  # pass (docs/SESSION_8.md), paired per scene, on PSNR and LPIPS and a
-  # high-frequency measure, never on PSNR alone.
-  val_num_batches: 20
+  # ------------------------------------------------------------------------
+  # DELIBERATELY MINIMAL, and the reason is the holdout, not the clock.
+  #
+  # `val_manifest` is the FROZEN EVAL HOLDOUT. Watching its loss during training
+  # and then choosing a checkpoint by what that curve did is selection on the
+  # eval set -- the exact thing this project has protected since session 6,
+  # where the rule was stated as "computing a mask is not tuning on it". A loss
+  # curve I can see IS tuning on it the moment it informs a stop.
+  #
+  # So: checkpoint selection is fixed A PRIORI to the final step. Validation
+  # runs rarely and only as a crash/NaN canary. The REPORTED holdout numbers
+  # come from one scoring pass after training (docs/SESSION_8.md) -- paired per
+  # scene, PSNR and LPIPS and a high-frequency measure, never PSNR alone.
+  #
+  # It is also expensive: 40 s/batch measured on an A6000, so 20 batches is 13
+  # minutes per validation, which at ckpt_every 500 was a large fraction of the
+  # whole run.
+  # ------------------------------------------------------------------------
+  val_num_batches: 4
   batch_size: 1
   validation_mode: 'propagation_0'
   ckpt_every: 500
-  sample_every: 500
+  sample_every: 2000
   num_views: 8
   # MUST equal the training cond_num. The manifest PLACED the clean references
   # in [0, 4); the released config's 1 would read three renders as references.
