@@ -66,6 +66,16 @@ three arms here, under identical statistics, seeds and decode:
     arm `gld_a`   neither slot         stock GLD generation, the MECHANISM baseline
     arm `geofix`  --cond-artifact      refinement                 (+ --mask-in-camera)
 
+and, for any claim made about the mask, its area-matched UNIFORM control:
+
+    arm `geofix_const`  --cond-artifact --mask-in-camera --mask-const match
+
+which feeds a spatially constant mask of the SAME per-frame area, so the only
+thing removed is WHERE the mask points. Session 6.5 measured this as the
+difference between a result and its opposite: `depth_disagree_a45` reads -0.151 dB
+against no mask and +0.375 dB against its area-matched control. Point the control
+at its own --out; the sbatch default derives the directory from the arm name.
+
 `render` is the endpoint the project's claim is made against; `gld_a` is what
 isolates the conditioning from the generator. Both are required, for a reason
 session 6.5 established the hard way: under degraded references arm A sat 0.584 dB
@@ -142,6 +152,70 @@ def build_batch(views: list[dict], device) -> dict:
     }
 
 
+def parse_mask_const(text: str):
+    """`--mask-const`: the literal `match`, or a float in [0, 1]."""
+    s = text.strip().lower()
+    if s == "match":
+        return "match"
+    try:
+        x = float(s)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"--mask-const takes 'match' or a float in [0,1]; got {text!r}.")
+    if not 0.0 <= x <= 1.0:
+        raise argparse.ArgumentTypeError(
+            f"--mask-const {x} is outside [0,1]. The mask is `edit1` in [0,1]; a "
+            "constant outside that range is not a control, it is an "
+            "out-of-distribution input.")
+    return x
+
+
+def constant_mask(msk: torch.Tensor, const, cond_num: int):
+    """(B,V,1,g,g) `edit1` mask -> the same tensor with every plane made UNIFORM.
+
+    The control asks whether the model reads WHERE the mask points or only HOW
+    MUCH of it there is. Removing placement while holding area fixed is the only
+    way to separate those, and getting the area wrong turns the control into a
+    second confound -- 6.5's `const_a{NN}` arms are matched per arm, and the
+    oracle's advantage over them swings +0.318 -> +0.985 -> -0.076 dB across the
+    area range, so a mismatched constant can manufacture or erase the whole effect.
+
+    Two modes, and `match` is the one to prefer:
+
+    - `match`  the constant is that VIEW's own mean, so area is matched exactly
+               per frame -- stronger than per-sample and much stronger than
+               6.5's per-arm matching. It preserves whatever frame-level severity
+               the mask carries (which our masks barely do -- `loso_logistic`
+               moves 0.493 -> 0.518 while the truth swings 0.053 -> 0.828) and
+               destroys placement alone. That is the clean isolation.
+    - a float  one fixed constant everywhere. It does NOT match area per sample,
+               so it confounds placement with area unless the arm it controls
+               happens to sit at that area; kept because a fixed level is also
+               how you ask "does the model respond to the scalar at all".
+
+    Polarity and range are untouched: `edit1`, [0, 1], no sign flip (hard rule 7).
+    The mean is taken AFTER `--gamma`, i.e. on the tensor the network actually
+    sees, so the match is in the space where it has to hold.
+
+    Only slots `[cond_num, V)` are written. Reference slots stay zero because the
+    model ignores them anyway -- `train_multiview_da3` assigns
+    `random_masks[:, cond_views:] = m_img[:, cond_views:]` -- and putting a
+    nonzero constant there would be a second, unmeasured change of input.
+    """
+    if msk[:, :cond_num].abs().max() > 0:
+        raise ValueError(
+            "reference slots [0, cond_num) carry a nonzero mask; GeoFixPairs "
+            "emits zeros there and the area match assumes it.")
+    out = torch.zeros_like(msk)
+    tgt = msk[:, cond_num:]
+    if const == "match":
+        fill = tgt.mean(dim=(-2, -1), keepdim=True).expand_as(tgt)
+    else:
+        fill = torch.full_like(tgt, float(const))
+    out[:, cond_num:] = fill
+    return out, float(fill.mean())
+
+
 def to_uint8(rgb: torch.Tensor) -> np.ndarray:
     """(3, H, W) in [0, 1] -> (H, W, 3) uint8, matching the export's PNG convention."""
     x = rgb.detach().float().clamp(0, 1).cpu().numpy()
@@ -196,6 +270,23 @@ def main() -> int:
                          "cond_artifact=T / mask_in_camera=F, i.e. the `geofix` arm: "
                          "the mask arrives at sampling time, so the network needs no "
                          "mask input at all.")
+    ap.add_argument("--mask-const", type=parse_mask_const, default=None,
+                    metavar="match|FLOAT",
+                    help="AREA-MATCHED UNIFORM CONTROL. Replace the mask fed to "
+                         "camera channel 0 with a spatially CONSTANT plane, "
+                         "keeping polarity (`edit1`, [0,1]) and area but "
+                         "destroying placement. Requires --mask-in-camera.\n"
+                         "  match  - the constant is each TARGET VIEW's own mean "
+                         "mask value, so area is matched exactly per frame. This "
+                         "is the mode to use: it isolates placement and nothing "
+                         "else.\n"
+                         "  FLOAT  - one fixed constant on every target view. "
+                         "Does not match area per sample, so it re-confounds "
+                         "placement with area; use it only to probe the scalar.\n"
+                         "Every deployable-mask claim needs this arm: 6.5 measured "
+                         "an arm at -0.151 dB against no mask and +0.375 dB "
+                         "against its area control -- ignoring it inverted the "
+                         "sign of the conclusion.")
     ap.add_argument("--gamma", type=float, default=1.0,
                     help="Contrast exponent on the pooled mask; must match training.")
     ap.add_argument("--seed", type=int, default=0,
@@ -224,6 +315,22 @@ def main() -> int:
                          "sat below it under degraded refs), so having it produced by "
                          "the same walk removes any chance of a misaligned pairing.")
     args = ap.parse_args()
+
+    if args.mask_const is not None:
+        if not args.mask_in_camera:
+            raise SystemExit(
+                "--mask-const is the area-matched control for the camera-channel "
+                "mask and does nothing without --mask-in-camera. Add it, or drop "
+                "--mask-const rather than shipping an arm whose name says control "
+                "and whose inputs say otherwise.")
+        if args.blend_mask:
+            # The blend path reads batch["mask"] directly, so a constant here
+            # would leave the composite running on the REAL mask -- a half-control
+            # that reads as a control. Refuse rather than mislabel it.
+            raise SystemExit(
+                "--mask-const with --blend-mask is not supported: the "
+                "sampling-time composite reads the real mask, so the run would be "
+                "a control in name only.")
 
     if not (args.cond_artifact or args.mask_in_camera):
         print("[infer] NOTE: neither slot enabled -- this is stock GLD generation "
@@ -325,6 +432,7 @@ def main() -> int:
     from eval_gld_metric import get_cascade_features
 
     rae, stat_path = ctx["rae"], ctx["stat_path"]
+    const_areas: list[float] = []
     written = 0
     t_start = time.time()
 
@@ -371,6 +479,14 @@ def main() -> int:
                 f"camera-channel injection takes ONE mask plane, manifest stacks "
                 f"{msk.shape[2]}. Reducing several planes to one is a modelling "
                 "decision; make it explicitly rather than here.")
+        if msk is not None and args.mask_const is not None:
+            # Placement out, area held. Recorded per sample so the provenance can
+            # state the area this control actually ran at.
+            msk, const_area = constant_mask(msk, args.mask_const, cond)
+            const_areas.append(const_area)
+            if done == 0:
+                print(f"[infer] mask-const {args.mask_const!r}: uniform plane, "
+                      f"mean {const_area:.4f} on target views", flush=True)
 
         feat, feat_denorm = {}, {}
         blend1 = None
@@ -506,6 +622,19 @@ def main() -> int:
         "decode": "latent_blending.build_context + L1 gen + learned cascade + decode_into_images",
         "command": " ".join(sys.argv),
     }
+    if args.mask_const is not None:
+        # Written ONLY for a control run, so an arm produced before this flag
+        # existed keeps a byte-identical provenance file -- and any arm that IS a
+        # control says so, with the area it ran at, next to `gamma` and
+        # `mask_polarity`. An unlabelled control is a trap.
+        prov["mask_const"] = args.mask_const
+        prov["mask_const_mode"] = ("per-view area match" if args.mask_const == "match"
+                                   else "fixed constant (area NOT matched per sample)")
+        prov["mask_const_area_mean"] = (sum(const_areas) / len(const_areas)
+                                        if const_areas else None)
+        prov["mask_const_area_min"] = min(const_areas) if const_areas else None
+        prov["mask_const_area_max"] = max(const_areas) if const_areas else None
+        prov["mask_spatial"] = "UNIFORM (area-matched control; placement removed)"
     out_root.mkdir(parents=True, exist_ok=True)
     (out_root / (f"_provenance.shard{args.shard}.json" if args.num_shards > 1 else "_provenance.json")).write_text(json.dumps(prov, indent=2))
     print(f"[infer] done: {written} frames from {n} samples -> {out_root}", flush=True)
