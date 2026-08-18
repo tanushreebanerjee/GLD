@@ -173,11 +173,43 @@ def main() -> int:
                     help="Grade camera channel 0 by M_edit. Trains, but only after "
                          "~70 steps of LR warmup absorb the distribution shift -- see "
                          "src/utils/geofix_slots.py before reading an early curve.")
+    ap.add_argument("--cond-source", default="render",
+                    choices=("render", "gt", "zeros", "shuffled"),
+                    help="WHAT goes in slot 1, holding everything else fixed. This is "
+                         "the causal test of whether the finetune learned to READ that "
+                         "slot or merely ignores it and does novel-view synthesis:\n"
+                         "  render   - the degraded 3DGS render (normal operation)\n"
+                         "  gt       - the CLEAN target. Positive control: a model that "
+                         "copies from slot 1 should jump toward the ceiling; a model "
+                         "doing pure NVS is INVARIANT and will not move.\n"
+                         "  zeros    - stock GLD content. Equals the gld_a arm; if "
+                         "`render` scores the same, the slot is being ignored.\n"
+                         "  shuffled - ANOTHER sample's render. Negative control: "
+                         "invariance means ignored, corruption means genuinely read.")
+    ap.add_argument("--blend-mask", action="store_true",
+                    help="Composite toward the render's features at every ODE step, "
+                         "weighted by M_edit -- session 6.5's training-free mechanism, "
+                         "applied to a FINETUNED model. Preservation outside the mask "
+                         "then holds BY CONSTRUCTION instead of being learned, which "
+                         "is the failure measured on the slot route (edits only 1.76x "
+                         "stronger inside a PERFECT mask). Pair it with a model trained "
+                         "cond_artifact=T / mask_in_camera=F, i.e. the `geofix` arm: "
+                         "the mask arrives at sampling time, so the network needs no "
+                         "mask input at all.")
     ap.add_argument("--gamma", type=float, default=1.0,
                     help="Contrast exponent on the pooled mask; must match training.")
     ap.add_argument("--seed", type=int, default=0,
                     help="Fixed across arms so xT is identical and the comparison is paired.")
     ap.add_argument("--limit", type=int, default=None, help="Smoke: first N samples only.")
+    ap.add_argument("--weights", choices=("ema", "model"), default="ema",
+                    help="Which tensors to load from the checkpoint. EMA is the "
+                         "right choice at convergence and the WRONG one early: "
+                         "ema_decay 0.9995 is a 2000-step time constant, so at step "
+                         "500 the EMA is still 78%% the released initialisation "
+                         "(measured drift 0.0021 vs the raw model's 0.0109). An "
+                         "early EMA evaluated with the conditioning slots on is "
+                         "essentially the RELEASED model fed inputs it never saw, "
+                         "which reads as a broken finetune rather than a young one.")
     ap.add_argument("--shard", type=int, default=0)
     ap.add_argument("--num-shards", type=int, default=1,
                     help="Slice samples [shard::num_shards]. Needed, not merely "
@@ -202,6 +234,19 @@ def main() -> int:
     if device.type != "cuda":
         raise RuntimeError("inference needs a GPU; got CPU only.")
 
+    import latent_blending as _lb
+    if args.weights == "model":
+        # build_context's load_ckpt does ckpt.get("ema", ckpt.get("model", ckpt)).
+        # Rather than fork that function, drop the EMA key on the way past so the
+        # same code path picks `model` -- one place, and it still enforces the
+        # 0-missing/0-unexpected check that catches a config/checkpoint mismatch.
+        _orig_load = _lb.torch.load
+        def _load_no_ema(path, *a, **kw):
+            d = _orig_load(path, *a, **kw)
+            if isinstance(d, dict) and "model" in d:
+                d = {k: v for k, v in d.items() if k != "ema"}
+            return d
+        _lb.torch.load = _load_no_ema
     from latent_blending import build_context
     from video.geofix_pairs import GeoFixPairs, assert_view_config
 
@@ -305,7 +350,21 @@ def main() -> int:
             print(f"[infer] image range [{lo:.3f}, {hi:.3f}] OK", flush=True)
         geo_batch = {k: batch[k] for k in ("image", "c2w", "intrinsic")}
 
-        art = batch["image"] if args.cond_artifact else None
+        art = None
+        if args.cond_artifact:
+            if args.cond_source == "render":
+                art = batch["image"]
+            elif args.cond_source == "gt":
+                art = batch["gt"]
+            elif args.cond_source == "zeros":
+                # Leave the slot at zeros, which IS stock GLD. Deliberately not a
+                # zero-valued image encoded through the RAE -- that would be the
+                # features of a black frame, not an empty slot.
+                art = None
+            elif args.cond_source == "shuffled":
+                # A different sample's render, same shapes. Uses the NEXT index in the
+                # dataset rather than a random one so the arm is reproducible.
+                art = build_batch(dataset[(i + 1) % n], device)["image"]
         msk = batch["mask"] if args.mask_in_camera else None
         if msk is not None and msk.shape[2] != 1:
             raise ValueError(
@@ -314,6 +373,24 @@ def main() -> int:
                 "decision; make it explicitly rather than here.")
 
         feat, feat_denorm = {}, {}
+        blend1 = None
+        if args.blend_mask:
+            from stage2.transport.blending import LatentBlend
+            from latent_blending import encode_artifact
+            # Level 1 ONLY. Session 6.5 measured compositing at level 0 as well to be
+            # worth +0.100 dB for one mask and -0.268 for another, and the cascade
+            # already propagates the level-1 composite -- so a second composite is a
+            # moving part for no gain.
+            f_art = encode_artifact(rae, batch["image"], 1, stat_path, device)
+            m = batch["mask"]
+            if m.shape[2] != 1:
+                raise ValueError(
+                    f"blend takes ONE mask plane, got {m.shape[2]}; reducing several "
+                    "planes to one is a modelling decision, not this script's.")
+            # (B,V,1,g,g) -> (B*V,1,g,g), matching f_art's flattened batch.
+            m = m.reshape(-1, 1, m.shape[3], m.shape[4]).to(device=device,
+                                                            dtype=f_art.dtype)
+            blend1 = LatentBlend(total_view=v, cond_num=cond).arm(f_art, m)
 
         # --- stage 1: noise -> L1, with the GeoFix slots ---------------------
         rae.level = 1
@@ -325,7 +402,7 @@ def main() -> int:
         torch.cuda.manual_seed_all(args.seed + i)
         feat[1] = get_denoised_features(
             rae=rae, model=ctx["model1"], transport=ctx["transport"],
-            sampler=ctx["make_sample_fn"](None), loader=None, device=device,
+            sampler=ctx["make_sample_fn"](blend1), loader=None, device=device,
             total_view=v, cond_num=cond, val_num_batches=1,
             use_prope=ctx["use_prope"], rank=0, world_size=1,
             prope_image_size=ctx["hw"], predict_cls=False, joint_ode=False,
@@ -381,6 +458,15 @@ def main() -> int:
             for k, stem in enumerate(stems):
                 Image.fromarray(to_uint8(batch["image"][0, cond + k])).save(dr / f"{stem}.png")
 
+        if blend1 is not None and done == 0:
+            # A hook that never fires returns arm A while claiming to have blended --
+            # the exact failure session 6.5 built its validation around.
+            if blend1.n_calls == 0:
+                raise RuntimeError(
+                    "blend hook armed but n_calls == 0: the sampler never called it, "
+                    "so this run is unblended generation wearing a blend's name.")
+            print(f"[infer] blend hook fired {blend1.n_calls} times on sample 0",
+                  flush=True)
         if (done + 1) % 10 == 0 or done + 1 == len(indices):
             el = time.time() - t_start
             print(f"[infer] {done + 1}/{len(indices)} samples, {written} frames, "
@@ -397,6 +483,13 @@ def main() -> int:
         "checkpoint_level1": str(args.checkpoint_level1),
         "checkpoint_cascade": str(args.checkpoint_cascade),
         "stats_dir": str(args.stats_dir),
+        # Recorded because it CHANGES THE PIXELS: A6000 and H200 diverge
+        # structurally over a 50-step bf16 ODE (max|diff| 0.93). Two arms with
+        # different values here are not comparable, whatever their seeds say.
+        "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
+        "weights": args.weights,
+        "cond_source": args.cond_source,
+        "blend_mask": bool(args.blend_mask),
         "cond_artifact": bool(args.cond_artifact),
         "mask_in_camera": bool(args.mask_in_camera),
         "mask_types": list(manifest["mask_types"]),
