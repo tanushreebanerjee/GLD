@@ -890,7 +890,15 @@ def main() -> int:
                 # not leave a truncated .npz that the resume check then accepts.
                 gt_path = d / f"{stem}.geom.npz"
                 tmp = gt_path.with_suffix(".npz.tmp")
-                np.savez_compressed(tmp, **{kk: vv[cond + k] for kk, vv in geom.items()})
+                # Write through a FILE HANDLE, not a path. np.savez_compressed
+                # APPENDS ".npz" to any path that does not already end in it, so
+                # passing `tmp` writes "...geom.npz.tmp.npz" and the os.replace
+                # below then fails on a file that was never created. Same class of
+                # trap as PIL inferring its encoder from the extension (see
+                # save_atomic): the library silently rewrites the name you gave it.
+                with open(tmp, "wb") as fh:
+                    np.savez_compressed(
+                        fh, **{kk: vv[cond + k] for kk, vv in geom.items()})
                 os.replace(tmp, gt_path)
             written += 1
         if render_root is not None:
