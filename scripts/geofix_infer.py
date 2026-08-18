@@ -95,6 +95,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
 import sys
 import time
@@ -220,6 +221,45 @@ def to_uint8(rgb: torch.Tensor) -> np.ndarray:
     """(3, H, W) in [0, 1] -> (H, W, 3) uint8, matching the export's PNG convention."""
     x = rgb.detach().float().clamp(0, 1).cpu().numpy()
     return (np.transpose(x, (1, 2, 0)) * 255.0 + 0.5).astype(np.uint8)
+
+
+def sample_is_complete(d: pathlib.Path, stems: list[str]) -> bool:
+    """True if every target PNG for this sample is present AND decodable.
+
+    Needed because a scavenger preemption kills the process mid-sample. Without
+    this the shard restarts at index 0 and redoes up to ~1.4 h of finished work,
+    which makes preemptible capacity a bad trade rather than free throughput.
+
+    `Image.verify()` rather than a size check: a job killed mid-write leaves a
+    TRUNCATED png, and skipping one of those would silently ship a corrupt frame
+    to the scorer. Verify is cheap (header + CRC, no full decode) and it is the
+    difference between "resume" and "resume, usually".
+    """
+    for stem in stems:
+        f = d / f"{stem}.png"
+        if not f.is_file():
+            return False
+        try:
+            with Image.open(f) as im:
+                im.verify()
+        except Exception:
+            return False
+    return True
+
+
+def save_atomic(arr, path: pathlib.Path) -> None:
+    """Write via a temp file in the same directory, then os.replace.
+
+    os.replace is atomic within a filesystem, so a reader (or a restarted shard)
+    never observes a half-written png. Writing in place is what would make
+    sample_is_complete's verify necessary in the first place.
+    """
+    tmp = path.with_suffix(".png.tmp")
+    # format="PNG" is REQUIRED: PIL infers the encoder from the extension, and
+    # ".tmp" is unknown to it. Without this every resumed shard dies on its first
+    # write -- caught by the round-trip test, not by inspection.
+    Image.fromarray(arr).save(tmp, format="PNG")
+    os.replace(tmp, path)
 
 
 def main() -> int:
@@ -436,6 +476,8 @@ def main() -> int:
     written = 0
     t_start = time.time()
 
+    skipped = 0
+    processed = 0
     for done, i in enumerate(indices):
         sample = dataset.samples[i]
         split = sample["split"]                     # already "K_06/<scene>__run_XXX__it_YYYYY"
@@ -444,11 +486,19 @@ def main() -> int:
             raise ValueError(
                 f"sample {i} ({split}) has {len(stems)} targets, expected {v - cond}.")
 
+        # RESUME. The per-sample seed keys off the GLOBAL index i, not off the
+        # loop counter, so skipping a finished sample leaves every remaining
+        # sample's noise identical to an uninterrupted run -- the arms stay
+        # paired. That is the property that makes resuming safe here.
+        if sample_is_complete(out_root / split, stems):
+            skipped += 1
+            continue
+
         batch = build_batch(dataset[i], device)
         # Cheap, and it catches the double-normalisation class of bug at the one
         # place it can enter. [0,1] imagery is the contract every downstream
         # normalise() assumes; ImageNet-normalised input reads about [-2.1, 2.6].
-        if done == 0:
+        if processed == 0:
             lo, hi = float(batch["image"].min()), float(batch["image"].max())
             if lo < -0.01 or hi > 1.01:
                 raise ValueError(
@@ -566,15 +616,16 @@ def main() -> int:
         d = out_root / split
         d.mkdir(parents=True, exist_ok=True)
         for k, stem in enumerate(stems):
-            Image.fromarray(to_uint8(rgb[cond + k])).save(d / f"{stem}.png")
+            save_atomic(to_uint8(rgb[cond + k]), d / f"{stem}.png")
             written += 1
         if render_root is not None:
             dr = render_root / split
             dr.mkdir(parents=True, exist_ok=True)
             for k, stem in enumerate(stems):
-                Image.fromarray(to_uint8(batch["image"][0, cond + k])).save(dr / f"{stem}.png")
+                save_atomic(to_uint8(batch["image"][0, cond + k]), dr / f"{stem}.png")
+        processed += 1
 
-        if blend1 is not None and done == 0:
+        if blend1 is not None and processed == 0:
             # A hook that never fires returns arm A while claiming to have blended --
             # the exact failure session 6.5 built its validation around.
             if blend1.n_calls == 0:
@@ -605,6 +656,7 @@ def main() -> int:
         "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
         "weights": args.weights,
         "cond_source": args.cond_source,
+        "samples_skipped_complete": skipped,
         "blend_mask": bool(args.blend_mask),
         "cond_artifact": bool(args.cond_artifact),
         "mask_in_camera": bool(args.mask_in_camera),
@@ -637,7 +689,8 @@ def main() -> int:
         prov["mask_spatial"] = "UNIFORM (area-matched control; placement removed)"
     out_root.mkdir(parents=True, exist_ok=True)
     (out_root / (f"_provenance.shard{args.shard}.json" if args.num_shards > 1 else "_provenance.json")).write_text(json.dumps(prov, indent=2))
-    print(f"[infer] done: {written} frames from {n} samples -> {out_root}", flush=True)
+    print(f"[infer] done: {written} frames from {n} samples "
+          f"({skipped} samples skipped as already complete) -> {out_root}", flush=True)
     print(f"[infer] score with: python -m geofix.baselines.flux2d --mode score "
           f"--manifest {args.manifest} --arm render --arm this={out_root} ...",
           flush=True)
