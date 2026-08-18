@@ -63,6 +63,19 @@ import wandb
 from utils.camera.camera import get_camera_embedding
 from datetime import datetime
 
+def _geofix_diag_zero():
+    """Zeroed accumulators for the mask-split loss diagnostic (loss_edit /
+    loss_keep). Observability only -- nothing here touches a gradient.
+
+    `n` counts only the units (micro-batches, then optimizer steps) that
+    actually carried a mask. Averaging by `n` rather than by the total keeps a
+    mask-free unit from diluting the number, and `n == 0` means "emit nothing"
+    rather than "0.0": a logged zero would read as "no error in the keep
+    region", which is false, not merely unmeasured.
+    """
+    return {"edit": 0.0, "keep": 0.0, "frac": 0.0, "n": 0}
+
+
 def prepare_data(
     rae, images, intrinsic, extrinsic, device,
     random_cond_num: int = 1,
@@ -1001,6 +1014,7 @@ def main(args):
     running_loss = 0.0
     running_ref_loss = 0.0
     running_tgt_loss = 0.0
+    geofix_run = _geofix_diag_zero()   # GeoFix mask-split diagnostic
     wandb_initialized = False  # Track wandb initialization state for resume support
     start_time = time()
 
@@ -1063,6 +1077,7 @@ def main(args):
         step_loss_accum = 0.0
         step_ref_loss_accum = 0.0
         step_tgt_loss_accum = 0.0
+        geofix_step = _geofix_diag_zero()
         if rank == 0:
         # Wrap the loader with tqdm on Rank 0 only
         # Set initial to show correct position after fast resume
@@ -1215,6 +1230,15 @@ def main(args):
                 x1_global=x1_all,        # Target part [all views clean]
                 freeze_cond=False        
             )
+
+            # GeoFix DIAGNOSTIC (loss_edit / loss_keep). The token-grid mask is
+            # handed to the transport so it can split the target loss by mask;
+            # it changes no gradients and is dropped before the model call. Only
+            # added when a mask actually exists, so stock GLD and the
+            # `--geofix-no-mask` ablation arm see the identical model_kwargs
+            # they saw before and log nothing rather than a misleading 0.0.
+            if geofix_mask is not None:
+                model_kwargs['geofix_mask_tokens'] = geofix_mask
 
             
             # Support ProPE (Fail-loud + consistent normalization)
@@ -1415,6 +1439,12 @@ def main(args):
                     loss_tensor = loss_dict["loss"].mean()
                     ref_loss_tensor = loss_dict.get("ref_loss", loss_tensor).mean()
                     tgt_loss_tensor = loss_dict.get("tgt_loss", loss_tensor).mean()
+                    # GeoFix diagnostic; absent (None) whenever there is no mask.
+                    # Never `or 0.0` -- a zero would read as "no error in the
+                    # keep region", which is false.
+                    edit_loss_tensor = loss_dict.get("loss_edit", None)
+                    keep_loss_tensor = loss_dict.get("loss_keep", None)
+                    mask_frac_tensor = loss_dict.get("mask_edit_frac", None)
                 except Exception as e:
                     logger.error(f"Exception during forward pass at step {train_steps}: {e}")
                     logger.error(f"Latent stats before forward - Mean: {x1_cond.mean().item():.6f}, Std: {x1_cond.std().item():.6f}")
@@ -1458,6 +1488,7 @@ def main(args):
                 step_loss_accum = 0.0
                 step_ref_loss_accum = 0.0
                 step_tgt_loss_accum = 0.0
+                geofix_step = _geofix_diag_zero()
                 continue
 
             # ============================================================
@@ -1466,6 +1497,13 @@ def main(args):
             step_loss_accum += loss_tensor.item()
             step_ref_loss_accum += ref_loss_tensor.item()
             step_tgt_loss_accum += tgt_loss_tensor.item()
+            # GeoFix mask-split diagnostic. Present only when a mask was passed;
+            # `edit` and `keep` always appear together or not at all.
+            if edit_loss_tensor is not None and keep_loss_tensor is not None:
+                geofix_step["edit"] += edit_loss_tensor.item()
+                geofix_step["keep"] += keep_loss_tensor.item()
+                geofix_step["frac"] += mask_frac_tensor.item()
+                geofix_step["n"] += 1
             
             # Use no_sync() for all but the last accumulation step to avoid unnecessary communication
             if (accum_counter + 1) % grad_accum_steps != 0:
@@ -1491,6 +1529,7 @@ def main(args):
                 step_loss_accum = 0.0
                 step_ref_loss_accum = 0.0
                 step_tgt_loss_accum = 0.0
+                geofix_step = _geofix_diag_zero()
                 continue
             
             accum_counter += 1
@@ -1512,12 +1551,20 @@ def main(args):
             running_loss += step_loss_accum / grad_accum_steps
             running_ref_loss += step_ref_loss_accum / grad_accum_steps
             running_tgt_loss += step_tgt_loss_accum / grad_accum_steps
+            # Average over the micro-batches that carried a mask, not over
+            # grad_accum_steps, so a mask-free micro-batch cannot pull the
+            # diagnostic toward zero.
+            if geofix_step["n"] > 0:
+                for _k in ("edit", "keep", "frac"):
+                    geofix_run[_k] += geofix_step[_k] / geofix_step["n"]
+                geofix_run["n"] += 1
             log_steps += 1
             train_steps += 1
             accum_counter = 0
             step_loss_accum = 0.0
             step_ref_loss_accum = 0.0
             step_tgt_loss_accum = 0.0
+            geofix_step = _geofix_diag_zero()
 
             # Smoke-test bound (GeoFix). `epochs` cannot express "10 steps", and a
             # smoke run that has to be killed by hand never proves checkpointing
@@ -1563,13 +1610,47 @@ def main(args):
                 avg_loss = avg_loss.item() / world_size
                 avg_ref_loss = avg_ref_loss.item() / world_size
                 avg_tgt_loss = avg_tgt_loss.item() / world_size
-                logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Ref: {avg_ref_loss:.4f}, Tgt: {avg_tgt_loss:.4f}, Steps/Sec: {steps_per_sec:.2f}")
+
+                # ------------------------------------------------------------
+                # GeoFix mask-split diagnostic (loss_edit / loss_keep). The
+                # all_reduce is UNCONDITIONAL -- ranks can legitimately disagree
+                # about whether they saw a mask, and a rank-conditional
+                # collective deadlocks DDP. Ranks with no mask contribute zeros
+                # AND a zero count, so they do not bias the mean; we divide by
+                # the reduced count, not by world_size.
+                #
+                # Reading it: if the model is learning "preserve where M = 0",
+                # `Keep` should fall RELATIVE to `Edit` over training. A flat
+                # ratio means the mask is an input the model is ignoring.
+                # ------------------------------------------------------------
+                geofix_vec = torch.tensor(
+                    [geofix_run["edit"], geofix_run["keep"], geofix_run["frac"],
+                     float(geofix_run["n"])],
+                    device=device, dtype=torch.float64)
+                dist.all_reduce(geofix_vec, op=dist.ReduceOp.SUM)
+                geofix_n = geofix_vec[3].item()
+                geofix_msg = ""
+                geofix_wandb = {}
+                if geofix_n > 0:
+                    avg_edit_loss = geofix_vec[0].item() / geofix_n
+                    avg_keep_loss = geofix_vec[1].item() / geofix_n
+                    avg_mask_frac = geofix_vec[2].item() / geofix_n
+                    geofix_msg = (f", Edit: {avg_edit_loss:.4f}, Keep: {avg_keep_loss:.4f}"
+                                  f", MaskFrac: {avg_mask_frac:.3f}")
+                    geofix_wandb = {
+                        "edit loss": avg_edit_loss,
+                        "keep loss": avg_keep_loss,
+                        "mask edit frac": avg_mask_frac,
+                    }
+
+                logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Ref: {avg_ref_loss:.4f}, Tgt: {avg_tgt_loss:.4f}{geofix_msg}, Steps/Sec: {steps_per_sec:.2f}")
                 if args.wandb:
                     wandb_utils.log(
                         {
                             "train loss": avg_loss, 
                             "ref loss": avg_ref_loss,
                             "tgt loss": avg_tgt_loss,
+                            **geofix_wandb,
                             "train steps/sec": steps_per_sec
                         },
                         step=train_steps,
@@ -1577,6 +1658,7 @@ def main(args):
                 running_loss = 0.0
                 running_ref_loss = 0.0
                 running_tgt_loss = 0.0
+                geofix_run = _geofix_diag_zero()
                 log_steps = 0
                 start_time = time()
 

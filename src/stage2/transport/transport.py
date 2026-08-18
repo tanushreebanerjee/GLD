@@ -258,6 +258,10 @@ class Transport:
         # Extract concat mode flag (use .get to avoid mutating shared model_kwargs)
         is_concat_mode = model_kwargs.get("is_concat_mode", False)
         x1_global = model_kwargs.get("x1_global", None)  # GT global feature for concat mode
+        # GeoFix DIAGNOSTIC ONLY (see the loss_edit/loss_keep block below). The
+        # token-grid mask rides in model_kwargs so the loss can see it; it is
+        # dropped before the model call, exactly like `total_view`.
+        geofix_mask_tokens = model_kwargs.get("geofix_mask_tokens", None)
         
         # ------------------------------------------------------------
         # 1. Sample init noise x0 and time t
@@ -323,8 +327,10 @@ class Transport:
         xt_flat = xt  # already flat
         
         # Minkyung debugging: Remove duplicate 'total_view' from model_kwargs
-        if 'total_view' in model_kwargs:
-            model_kwargs = {k: v for k, v in model_kwargs.items() if k != 'total_view'}
+        # 'geofix_mask_tokens' is loss-side only and must never reach the model.
+        _drop_kwargs = ('total_view', 'geofix_mask_tokens')
+        if any(k in model_kwargs for k in _drop_kwargs):
+            model_kwargs = {k: v for k, v in model_kwargs.items() if k not in _drop_kwargs}
         
         
         model_output = model(xt_flat, t, total_view, **model_kwargs)
@@ -355,7 +361,80 @@ class Transport:
             terms['loss'] = mean_flat(rearrange(diff_sq, "b v c h w -> (b v) c h w"))
             terms['ref_loss'] = mean_flat(rearrange(ref_diff_sq, "b v c h w -> (b v) c h w"))
             terms['tgt_loss'] = mean_flat(rearrange(tgt_diff_sq, "b v c h w -> (b v) c h w"))
-            
+
+            # ----------------------------------------------------------------
+            # GeoFix DIAGNOSTIC: split the TARGET loss into an "edit" part and a
+            # "keep" part by the conditioning mask. OBSERVABILITY ONLY -- this
+            # runs under no_grad on a detached tensor and no key produced here is
+            # ever backwarded, so gradients are bit-for-bit what they were.
+            #
+            # Why it exists. The mask is currently only an INPUT; it is never a
+            # weight. `mean_flat` weights all 36x36 tokens equally, so the
+            # training curve cannot tell us whether the model is learning the
+            # "preserve where the mask is 0" behaviour at all. The failure this
+            # is meant to expose is session 8's arm A (stock GLD generation):
+            # +1.96 dB over the render on damaged scenes but -3.09 dB on clean
+            # ones -- it has no "leave this alone" mode. If a mask-conditioned
+            # model is learning to preserve, `loss_keep` should fall RELATIVE to
+            # `loss_edit` over training.
+            #
+            # Deliberately NOT a mask-weighted training loss. Weighting the
+            # gradient by M_edit would DOWNWEIGHT the preserve regions, i.e.
+            # suppress exactly the behaviour we lack. The diagnostic comes first.
+            #
+            # How the continuous mask is split. `oracle_lpips` at gamma is
+            # CONTINUOUS in [0, 1], not binary, so there is no region to slice.
+            # We use the mask-weighted mean and its complement rather than a
+            # threshold, because a threshold needs an arbitrary constant that
+            # would then have to be held fixed across runs to compare curves,
+            # and it discards the grading that the mask was chosen to carry. A
+            # token at M = 0.5 contributes half its error to each side.
+            #
+            # This is an EXACT decomposition of tgt_loss under the convex
+            # weighting (w_e, w_k) = (mean M, 1 - mean M):
+            #     mean(tgt_diff_sq) = w_e * loss_edit + w_k * loss_keep
+            # because mean(M*d) + mean((1-M)*d) = mean(d) identically. `w_e` is
+            # returned as `mask_edit_frac` so the recombination is checkable from
+            # the logs, and because mask AREA is itself worth watching -- our
+            # masks are near severity-blind, so a flat area trace is expected.
+            #
+            # Polarity (hard rule 7): the mask arrives `edit1`, 1.0 = degraded,
+            # repair here. So EDIT weights by M and KEEP weights by (1 - M). No
+            # sign flip -- the same no-flip that camera channel 0 enjoys.
+            # ----------------------------------------------------------------
+            if geofix_mask_tokens is not None:
+                m = geofix_mask_tokens
+                expected = (B, total_view, 1) + tuple(diff_sq.shape[3:])
+                if tuple(m.shape) != expected:
+                    raise ValueError(
+                        "geofix_mask_tokens shape mismatch in training_multiview_losses: "
+                        f"expected (B, V, 1, h, w) = {expected} to match diff_sq "
+                        f"{tuple(diff_sq.shape)} on the token grid, got {tuple(m.shape)}. "
+                        "The mask must already be MAX-pooled onto the latent token grid "
+                        "(hard rule 6); it is never resized here."
+                    )
+                with th.no_grad():
+                    # float32 regardless of the autocast dtype: these are sums
+                    # over ~10^6 elements and a bf16 accumulator would quietly
+                    # lose the small differences this diagnostic exists to see.
+                    m_tgt = m[:, cond_num:].to(
+                        device=tgt_diff_sq.device, dtype=th.float32)
+                    d_tgt = tgt_diff_sq.detach().to(th.float32)
+                    # Broadcast over the channel axis: one mask value per token,
+                    # applied to every feature channel of that token.
+                    n_elem = d_tgt.numel()
+                    w_edit = m_tgt.sum() * d_tgt.shape[2]      # sum of M over all elements
+                    w_keep = n_elem - w_edit
+                    if w_edit > 0 and w_keep > 0:
+                        terms['loss_edit'] = (m_tgt * d_tgt).sum() / w_edit
+                        terms['loss_keep'] = ((1.0 - m_tgt) * d_tgt).sum() / w_keep
+                        terms['mask_edit_frac'] = w_edit / n_elem
+                    # else: the mask is degenerate (all-edit or all-keep across
+                    # the whole target block) and one side has no support. Emit
+                    # NOTHING rather than a 0.0, which would read as "no error in
+                    # that region" -- which is false, it is undefined.
+
+
         else:
             # Target-Only Loss (Legacy)
             # Slice only target views
