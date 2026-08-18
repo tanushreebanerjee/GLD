@@ -171,6 +171,23 @@ def parse_mask_const(text: str):
     return x
 
 
+def assert_ref_slots_zero(msk: torch.Tensor, cond_num: int) -> None:
+    """Reference slots `[0, cond_num)` must be all-zero before any mask control runs.
+
+    Lifted out of `constant_mask` verbatim -- message included -- so the
+    `--mask-transform` controls enforce the SAME invariant instead of a lookalike
+    that could drift from it. Every mask control here rewrites TARGET planes only:
+    the model ignores reference planes anyway (`train_multiview_da3` assigns
+    `random_masks[:, cond_views:] = m_img[:, cond_views:]`), so writing them would
+    be a second, unmeasured change of input -- and an area figure averaged over
+    them would not be the area the network sees.
+    """
+    if msk[:, :cond_num].abs().max() > 0:
+        raise ValueError(
+            "reference slots [0, cond_num) carry a nonzero mask; GeoFixPairs "
+            "emits zeros there and the area match assumes it.")
+
+
 def constant_mask(msk: torch.Tensor, const, cond_num: int):
     """(B,V,1,g,g) `edit1` mask -> the same tensor with every plane made UNIFORM.
 
@@ -203,10 +220,7 @@ def constant_mask(msk: torch.Tensor, const, cond_num: int):
     `random_masks[:, cond_views:] = m_img[:, cond_views:]` -- and putting a
     nonzero constant there would be a second, unmeasured change of input.
     """
-    if msk[:, :cond_num].abs().max() > 0:
-        raise ValueError(
-            "reference slots [0, cond_num) carry a nonzero mask; GeoFixPairs "
-            "emits zeros there and the area match assumes it.")
+    assert_ref_slots_zero(msk, cond_num)
     out = torch.zeros_like(msk)
     tgt = msk[:, cond_num:]
     if const == "match":
@@ -217,13 +231,112 @@ def constant_mask(msk: torch.Tensor, const, cond_num: int):
     return out, float(fill.mean())
 
 
+#: `--mask-transform` arms. `none` is the default and MUST stay a no-op: array
+#: jobs queued against this file predate the flag and have to reproduce exactly.
+MASK_TRANSFORMS = ("none", "invert", "roll", "shuffle")
+
+
+def roll_offset(index: int, g_h: int, g_w: int) -> tuple[int, int]:
+    """Deterministic, sample-dependent, SUBSTANTIAL token-grid shift for `roll`.
+
+    Derived from the GLOBAL sample index rather than an RNG draw, for the same
+    reason the per-sample seed is: an 8-shard run must reproduce a 1-shard run,
+    and a control arm that cannot be reproduced is not a control.
+
+    The shift is confined to `[g/4, 3g/4)` on each axis rather than to `[1, g)`.
+    "Non-zero" is not enough: a one-token roll is a permutation, so it passes the
+    area check exactly, but it leaves a blob almost on top of itself and the arm
+    would read as "placement does not matter" when placement had barely changed.
+    Excluding the top quarter matters for the same reason, because the grid wraps
+    -- a 35-token shift on a 36-token grid is a one-token shift the other way. At
+    the 36x36 grid this is 9 to 26 tokens, i.e. at least 126 px at 504.
+    """
+    if g_h < 4 or g_w < 4:
+        raise ValueError(f"token grid {g_h}x{g_w} is too small to roll.")
+    # Knuth's multiplicative hash, so consecutive samples do not get consecutive
+    # offsets and the two axes are not locked to one another.
+    h = (index * 2654435761) % 4294967296
+    return g_h // 4 + h % (g_h // 2), g_w // 4 + (h // 4093) % (g_w // 2)
+
+
+def transform_mask(msk: torch.Tensor, transform: str, cond_num: int, index: int,
+                   donor: torch.Tensor | None = None):
+    """(B,V,1,g,g) `edit1` mask -> the same tensor with PLACEMENT destroyed.
+
+    The companion to `constant_mask`, and the reason both exist: a spatially
+    UNIFORM mask at M=0.78 is the best deployable configuration this project has
+    measured, so "the model responds to the mask" has to be separated from "the
+    model responds to how much mask there is". `constant_mask` removes placement
+    by flattening the plane; these three remove it while leaving the plane's
+    HISTOGRAM alone:
+
+    - `roll`     circularly shift the plane on the TOKEN grid by `roll_offset`.
+                 Area is preserved EXACTLY (a permutation of the same values),
+                 so it is the clean placement control -- the mask is as
+                 structured, as sparse and as severe as the real one, and only
+                 points somewhere else.
+    - `shuffle`  another sample's mask planes. Structure and area are both
+                 plausible but unrelated to this frame's damage. NEAR
+                 area-preserving, not exactly -- the donor has its own area, and
+                 both are recorded so the difference cannot be mistaken for
+                 placement.
+    - `invert`   `1 - M`. **NOT area-preserving**: area a becomes 1 - a, so this
+                 tests POLARITY sensitivity ("does the model treat 1 as repair
+                 here?") and NOT placement. Do not quote it as a placement
+                 control; at the areas our masks run at it also changes area by
+                 more than any placement effect measured so far.
+
+    Polarity (hard rule 7): `roll` and `shuffle` move values without touching
+    them -- no sign flip anywhere. `invert` IS the flip, deliberately, and is the
+    only member of this family that changes a value.
+
+    Hard rule 6: `msk` arrives already MAX-pooled to the 36x36 token grid by
+    `GeoFixPairs`, and `roll` shifts it THERE, before any upsample. Rolling a
+    504x504 plane and re-pooling would smear a thin floater across a token
+    boundary, which is the failure max pooling exists to prevent.
+
+    Applied AFTER `--gamma`, i.e. to the tensor the network actually sees --
+    the same convention `constant_mask` uses for its area match.
+
+    Only slots `[cond_num, V)` are written; reference slots stay zero.
+    """
+    assert_ref_slots_zero(msk, cond_num)
+    out = torch.zeros_like(msk)
+    tgt = msk[:, cond_num:]
+    area_pre = float(tgt.mean())
+    info: dict = {"transform": transform}
+    if transform == "invert":
+        new = 1.0 - tgt
+    elif transform == "roll":
+        sh, sw = roll_offset(index, int(msk.shape[-2]), int(msk.shape[-1]))
+        new = torch.roll(tgt, shifts=(sh, sw), dims=(-2, -1))
+        info["roll"] = (sh, sw)
+    elif transform == "shuffle":
+        if donor is None:
+            raise ValueError("--mask-transform shuffle needs a donor mask.")
+        if tuple(donor.shape) != tuple(msk.shape):
+            raise ValueError(
+                f"donor mask shape {tuple(donor.shape)} != {tuple(msk.shape)}; a "
+                "shuffle control must swap like for like or it is a shape change "
+                "wearing a control's name.")
+        assert_ref_slots_zero(donor, cond_num)
+        new = donor[:, cond_num:].to(device=tgt.device, dtype=tgt.dtype)
+    else:
+        raise ValueError(
+            f"unknown --mask-transform {transform!r}; expected one of "
+            f"{MASK_TRANSFORMS}.")
+    out[:, cond_num:] = new
+    return out, area_pre, float(new.mean()), info
+
+
 def to_uint8(rgb: torch.Tensor) -> np.ndarray:
     """(3, H, W) in [0, 1] -> (H, W, 3) uint8, matching the export's PNG convention."""
     x = rgb.detach().float().clamp(0, 1).cpu().numpy()
     return (np.transpose(x, (1, 2, 0)) * 255.0 + 0.5).astype(np.uint8)
 
 
-def sample_is_complete(d: pathlib.Path, stems: list[str]) -> bool:
+def sample_is_complete(d: pathlib.Path, stems: list[str],
+                       need_geom: bool = False) -> bool:
     """True if every target PNG for this sample is present AND decodable.
 
     Needed because a scavenger preemption kills the process mid-sample. Without
@@ -244,6 +357,19 @@ def sample_is_complete(d: pathlib.Path, stems: list[str]) -> bool:
                 im.verify()
         except Exception:
             return False
+        # A run that also wants geometry is NOT complete just because the RGB is
+        # there. Without this, adding --dump-depth to an arm that already has PNGs
+        # would skip every sample and produce an empty geometry set that looks
+        # finished.
+        if need_geom:
+            g = d / f"{stem}.geom.npz"
+            if not g.is_file():
+                return False
+            try:
+                with np.load(g) as z:
+                    _ = z.files
+            except Exception:
+                return False
     return True
 
 
@@ -327,6 +453,29 @@ def main() -> int:
                          "an arm at -0.151 dB against no mask and +0.375 dB "
                          "against its area control -- ignoring it inverted the "
                          "sign of the conclusion.")
+    ap.add_argument("--mask-transform", default="none", choices=MASK_TRANSFORMS,
+                    help="CAUSAL CONTROL ON THE MASK CHANNEL, the slot-2 analogue "
+                         "of --cond-source. Requires --mask-in-camera; refuses to "
+                         "combine with --mask-const or --blend-mask.\n"
+                         "  none    - default, a strict no-op (arms queued before "
+                         "this flag existed reproduce byte-identically).\n"
+                         "  invert  - 1 - M. NOT AREA-PRESERVING: area a becomes "
+                         "1 - a. This is a POLARITY test ('does the model treat 1 "
+                         "as repair here?'), not a placement control, and must "
+                         "never be quoted as one.\n"
+                         "  roll    - circularly shift the mask on the 36x36 TOKEN "
+                         "grid by a fixed offset derived from the sample index "
+                         "(reproducible, recorded in provenance; 9-26 tokens on "
+                         "each axis, so never a near-identity). "
+                         "EXACTLY area-preserving, same structure and sparsity, "
+                         "pointing in the wrong place. This is THE placement "
+                         "control.\n"
+                         "  shuffle - another sample's mask (the NEXT dataset "
+                         "index mod n, mirroring --cond-source shuffled). Near "
+                         "area-preserving; both areas are recorded.\n"
+                         "Read with --mask-const, not instead of it: a constant "
+                         "removes structure AND placement, roll removes placement "
+                         "alone.")
     ap.add_argument("--gamma", type=float, default=1.0,
                     help="Contrast exponent on the pooled mask; must match training.")
     ap.add_argument("--seed", type=int, default=0,
@@ -349,6 +498,17 @@ def main() -> int:
                          "split directories and per-shard provenance, and the "
                          "per-sample seed keys off the GLOBAL index so an 8-shard "
                          "run reproduces a 1-shard run exactly.")
+    ap.add_argument("--dump-depth", action="store_true",
+                    help="Also write the decoded DEPTH, depth confidence and RAYS "
+                         "per target view, as <split>/<stem>.geom.npz.\n"
+                         "This is the project's stated differentiator and it is "
+                         "currently thrown away: rae.decode already returns "
+                         "{rgb, depth, depth_conf, ray, ray_conf} on EVERY run and "
+                         "this script kept only 'rgb'. No prior refiner (Difix3D+, "
+                         "SyncFix, FreeFix) emits geometry at all, so an RGB-only "
+                         "evaluation competes with them on their own ground and "
+                         "silently drops ours. Costs one decode's worth of nothing "
+                         "-- the tensors are already in memory.")
     ap.add_argument("--dump-render", action="store_true",
                     help="Also write the unrefined render as a sibling arm. The "
                          "artifact endpoint is a REQUIRED control on this data (arm A "
@@ -371,6 +531,31 @@ def main() -> int:
                 "--mask-const with --blend-mask is not supported: the "
                 "sampling-time composite reads the real mask, so the run would be "
                 "a control in name only.")
+
+    if args.mask_transform != "none":
+        if not args.mask_in_camera:
+            raise SystemExit(
+                f"--mask-transform {args.mask_transform} rewrites the mask fed to "
+                "camera channel 0 and does nothing without --mask-in-camera. Add "
+                "it, or drop --mask-transform rather than shipping an arm whose "
+                "name says control and whose inputs say otherwise.")
+        if args.mask_const is not None:
+            # A constant plane has no placement left to destroy, so rolling or
+            # shuffling one is indistinguishable from the constant itself -- an
+            # arm that would report as two controls and act as one.
+            raise SystemExit(
+                f"--mask-transform {args.mask_transform} with --mask-const is "
+                "contradictory: a spatially constant mask has no placement to "
+                "destroy. Run them as SEPARATE arms.")
+        if args.blend_mask:
+            # Same failure --mask-const already refuses: the sampling-time
+            # composite reads batch["mask"] directly, so the transform would
+            # change only the camera channel while the blend kept running on the
+            # REAL mask -- a control in name only.
+            raise SystemExit(
+                f"--mask-transform {args.mask_transform} with --blend-mask is not "
+                "supported: the sampling-time composite reads the real mask, so "
+                "the run would be a control in name only.")
 
     if not (args.cond_artifact or args.mask_in_camera):
         print("[infer] NOTE: neither slot enabled -- this is stock GLD generation "
@@ -473,6 +658,12 @@ def main() -> int:
 
     rae, stat_path = ctx["rae"], ctx["stat_path"]
     const_areas: list[float] = []
+    # --mask-transform bookkeeping. Empty unless a transform arm is running, so
+    # the provenance of a `none` run is unchanged.
+    tf_area_pre: list[float] = []
+    tf_area_post: list[float] = []
+    roll_offsets: list[list[int]] = []
+    donor_indices: list[list[int]] = []
     written = 0
     t_start = time.time()
 
@@ -490,7 +681,8 @@ def main() -> int:
         # loop counter, so skipping a finished sample leaves every remaining
         # sample's noise identical to an uninterrupted run -- the arms stay
         # paired. That is the property that makes resuming safe here.
-        if sample_is_complete(out_root / split, stems):
+        if sample_is_complete(out_root / split, stems,
+                              need_geom=args.dump_depth):
             skipped += 1
             continue
 
@@ -537,6 +729,35 @@ def main() -> int:
             if done == 0:
                 print(f"[infer] mask-const {args.mask_const!r}: uniform plane, "
                       f"mean {const_area:.4f} on target views", flush=True)
+
+        if msk is not None and args.mask_transform != "none":
+            # Placement destroyed, values untouched (except `invert`, which IS the
+            # flip). Areas are recorded per sample on BOTH sides so a control arm
+            # can never be read as a real one.
+            donor = None
+            if args.mask_transform == "shuffle":
+                donor_i = (i + 1) % n
+                if donor_i == i:
+                    raise RuntimeError(
+                        "--mask-transform shuffle needs at least 2 samples; with "
+                        f"n={n} the donor is the sample itself, which is a no-op "
+                        "wearing a control's name.")
+                # Same donor rule as --cond-source shuffled: the NEXT index, not a
+                # random one, so the arm is reproducible and shard-invariant.
+                donor = build_batch(dataset[donor_i], device)["mask"]
+                donor_indices.append([i, donor_i])
+            msk, area_pre, area_post, tinfo = transform_mask(
+                msk, args.mask_transform, cond, i, donor=donor)
+            tf_area_pre.append(area_pre)
+            tf_area_post.append(area_post)
+            if "roll" in tinfo:
+                roll_offsets.append([i, int(tinfo["roll"][0]), int(tinfo["roll"][1])])
+            if done == 0:
+                print(f"[infer] mask-transform {args.mask_transform!r}: target-view "
+                      f"mean area {area_pre:.4f} -> {area_post:.4f}"
+                      + (f", roll {tinfo['roll']}" if "roll" in tinfo else "")
+                      + (f", donor {donor_indices[-1][1]}" if donor_indices else ""),
+                      flush=True)
 
         feat, feat_denorm = {}, {}
         blend1 = None
@@ -604,6 +825,53 @@ def main() -> int:
             stat_path=stat_path, sample_idx=0,
         )
         rgb = out["rgb"]
+        geom = {}
+        if args.dump_depth:
+            # Whatever the RAE actually emits, defensively -- which fields are
+            # non-None at level 1 is a property of the decoder, not something to
+            # assume. The first sample prints what it found, so the run itself
+            # records the answer instead of a comment claiming one.
+            for key in ("depth", "depth_conf", "ray", "ray_conf"):
+                t = out.get(key, None)
+                if t is None:
+                    continue
+                # Drop leading singleton axes BY SIZE, not by rank. The geometry
+                # keys do not share a rank: depth/depth_conf are (1, V, 504, 504)
+                # while ray is (1, V, 288, 288, 6) and ray_conf (1, V, 288, 288).
+                # An `ndim == 5` test therefore squeezes ray and leaves depth at
+                # (1, V, ...), which then trips the view check with "has 1 views,
+                # expected 8". Loud, but wrong, and it would have blocked the whole
+                # depth pass.
+                #
+                # Note also that RAY IS ON A DIFFERENT GRID: 288 = 8 * 36 tokens,
+                # because the aux pyramid's last level is returned at its own scale
+                # and never upsampled. Anything downstream that assumes one grid
+                # for depth and rays is wrong.
+                if v == 1:
+                    raise RuntimeError(
+                        "cannot disambiguate the batch axis from the view axis at "
+                        "v == 1; --dump-depth expects the 8-view protocol.")
+                while t.ndim > 1 and t.shape[0] == 1 and t.shape[0] != v:
+                    t = t[0]
+                if t.shape[0] != v:
+                    raise RuntimeError(
+                        f"decoded '{key}' has leading axis {t.shape[0]}, expected "
+                        f"{v} views (full shape {tuple(t.shape)}). Do not silently "
+                        "write a mis-shaped geometry tensor.")
+                geom[key] = t.detach().float().cpu().numpy()
+            if processed == 0:
+                found = {k: tuple(t.shape) for k, t in geom.items()}
+                missing = [k for k in ("depth", "depth_conf", "ray", "ray_conf")
+                           if k not in geom]
+                print(f"[infer] geometry emitted: {found}", flush=True)
+                if missing:
+                    print(f"[infer] geometry ABSENT from rae.decode: {missing}",
+                          flush=True)
+                if "depth" not in geom:
+                    raise RuntimeError(
+                        "--dump-depth given but rae.decode returned no 'depth'. "
+                        "Writing rgb-only files under a geometry flag would be a "
+                        "silent no-op; fix the decode level instead.")
         # Drop the batch axis ONCE, here. Getting this wrong does not crash in the
         # obvious place -- it broadcasts (latent_blending.run_sample says the same).
         if rgb.ndim == 5:
@@ -617,6 +885,13 @@ def main() -> int:
         d.mkdir(parents=True, exist_ok=True)
         for k, stem in enumerate(stems):
             save_atomic(to_uint8(rgb[cond + k]), d / f"{stem}.png")
+            if geom:
+                # Same atomic discipline as the PNGs: a shard killed mid-write must
+                # not leave a truncated .npz that the resume check then accepts.
+                gt_path = d / f"{stem}.geom.npz"
+                tmp = gt_path.with_suffix(".npz.tmp")
+                np.savez_compressed(tmp, **{kk: vv[cond + k] for kk, vv in geom.items()})
+                os.replace(tmp, gt_path)
             written += 1
         if render_root is not None:
             dr = render_root / split
@@ -657,6 +932,7 @@ def main() -> int:
         "weights": args.weights,
         "cond_source": args.cond_source,
         "samples_skipped_complete": skipped,
+        "dump_depth": bool(args.dump_depth),
         "blend_mask": bool(args.blend_mask),
         "cond_artifact": bool(args.cond_artifact),
         "mask_in_camera": bool(args.mask_in_camera),
@@ -687,6 +963,47 @@ def main() -> int:
         prov["mask_const_area_min"] = min(const_areas) if const_areas else None
         prov["mask_const_area_max"] = max(const_areas) if const_areas else None
         prov["mask_spatial"] = "UNIFORM (area-matched control; placement removed)"
+    if args.mask_transform != "none":
+        # Written ONLY for a transform run, so an arm produced before this flag
+        # existed keeps a byte-identical provenance file. Everything needed to
+        # tell a control from a real arm is here: what was done, where it was
+        # rolled to, whose mask was borrowed, and the area on both sides.
+        prov["mask_transform"] = args.mask_transform
+        prov["mask_transform_area_preserving"] = {
+            "invert": False, "roll": True, "shuffle": "approximately",
+        }[args.mask_transform]
+        prov["mask_transform_note"] = {
+            "invert": "1 - M. POLARITY test, NOT a placement control: area a -> 1-a.",
+            "roll": ("circular shift on the TOKEN grid by a per-sample offset "
+                     "from roll_offset(i, g, g), confined to [g/4, 3g/4) on each "
+                     "axis (9-26 tokens at g=36, both directions, so never a "
+                     "near-identity via wraparound); EXACTLY area-preserving; "
+                     "this is the placement control."),
+            "shuffle": ("mask of dataset sample (i + 1) % n; structure and area "
+                        "plausible but unrelated to this frame's damage."),
+        }[args.mask_transform]
+        prov["mask_transform_area_pre_mean"] = (
+            sum(tf_area_pre) / len(tf_area_pre) if tf_area_pre else None)
+        prov["mask_transform_area_post_mean"] = (
+            sum(tf_area_post) / len(tf_area_post) if tf_area_post else None)
+        prov["mask_transform_area_pre_min"] = min(tf_area_pre) if tf_area_pre else None
+        prov["mask_transform_area_pre_max"] = max(tf_area_pre) if tf_area_pre else None
+        prov["mask_transform_area_post_min"] = min(tf_area_post) if tf_area_post else None
+        prov["mask_transform_area_post_max"] = max(tf_area_post) if tf_area_post else None
+        prov["mask_transform_n_applied"] = len(tf_area_pre)
+        if args.mask_transform == "roll":
+            prov["mask_roll_offsets"] = roll_offsets     # [sample_index, dy, dx]
+            prov["mask_roll_offsets_key"] = "[sample_index, shift_rows, shift_cols]"
+        if args.mask_transform == "shuffle":
+            prov["mask_donor_indices"] = donor_indices   # [sample_index, donor_index]
+            prov["mask_donor_indices_key"] = "[sample_index, donor_sample_index]"
+            prov["mask_donor_rule"] = "(i + 1) % n, global dataset index"
+        prov["mask_spatial"] = (
+            "INVERTED (polarity control; area NOT preserved)"
+            if args.mask_transform == "invert" else
+            "MISPLACED (placement control; structure and area preserved)"
+            if args.mask_transform == "roll" else
+            "FOREIGN (placement control; another sample's mask)")
     out_root.mkdir(parents=True, exist_ok=True)
     (out_root / (f"_provenance.shard{args.shard}.json" if args.num_shards > 1 else "_provenance.json")).write_text(json.dumps(prov, indent=2))
     print(f"[infer] done: {written} frames from {n} samples "
