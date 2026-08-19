@@ -538,6 +538,22 @@ def main(args):
                 "mask-ON config; passing it to a mask-OFF config means one of the "
                 "two is not what you think it is.")
         geofix_mask_in_camera = False
+    # Same contract for slot 1, added 2026-08-19 for the REDUNDANCY control.
+    # The mask has been worth <= +0.039 dB at every checkpoint, and the leading
+    # explanation is not that it is uninformative but that it is REDUNDANT: slot 1
+    # already hands the model the artifact render, which contains the damage the
+    # mask points at. Turning slot 1 off measures the mask's value when the render
+    # is NOT supplied. If it is large there and ~0 with the render, the finding is
+    # redundancy, which is a different -- and more interesting -- claim than
+    # "the mask carries no information".
+    if getattr(args, "geofix_no_cond_artifact", False):
+        if not geofix_cond_artifact:
+            raise ValueError(
+                "--geofix-no-cond-artifact given but geofix.cond_artifact is already "
+                "false in the config. The flag exists to run the control off the "
+                "cond-ON config; passing it to a cond-OFF config means one of the "
+                "two is not what you think it is.")
+        geofix_cond_artifact = False
     if (geofix_cond_artifact or geofix_mask_in_camera) and dataset_name.lower() != "geofix":
         raise ValueError(
             f"geofix.* conditioning is on but dataset.name={dataset_name!r}. "
@@ -1825,6 +1841,14 @@ if __name__ == "__main__":
                              "baseline for 'does the mask add anything'. Uses the "
                              "same config file as the mask-on arm so nothing else "
                              "can differ between them.")
+
+    parser.add_argument("--geofix-no-cond-artifact", action="store_true",
+                        help="Force geofix.cond_artifact off, leaving mask_in_camera "
+                             "as configured. This is the REDUNDANCY control: it "
+                             "measures what the mask is worth when the artifact "
+                             "render is NOT supplied. Pairs with --geofix-no-mask "
+                             "to give all four cells of the two-slot ablation off "
+                             "ONE config file.")
 
     args = parser.parse_args()
     # Log level info
