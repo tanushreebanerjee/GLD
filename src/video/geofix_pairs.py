@@ -108,9 +108,9 @@ class GeoFixPairs(Dataset):
 
     Args:
         manifest: path to `geofix.train_manifest` output.
-        mask_types: which planes to stack, in order. Defaults to the manifest's
-            own list, which is also what its `n_mask` was derived from -- pass a
-            different one only with a matching `n_mask` on the model.
+        mask_types: which planes to stack, in order. The MANIFEST is the
+            authority. Passing a list that disagrees with it is an error, not an
+            override -- see the constructor.
         token_grid: 504 / 14 = 36 for DA3 at our render size.
         return_gt: also load the clean ground truth of the target views. Needed
             for a training target and for scoring; never for conditioning, and
@@ -129,7 +129,32 @@ class GeoFixPairs(Dataset):
         self.cond_num = int(m["cond_num"])
         self.token_grid = int(token_grid)
         self.return_gt = bool(return_gt)
-        self.mask_types = list(mask_types or m["mask_types"])
+        # The manifest is the authority on which planes this sample list means,
+        # and a disagreement is a HARD ERROR rather than an override.
+        #
+        # This used to read `list(mask_types or m["mask_types"])`, so a config's
+        # `dataset.mask_types` silently won. On 2026-08-19 the depth_disagree
+        # training arm ran with `manifest_masked_exclude_depthdis.json` and a
+        # config that still said `mask_types: [oracle_lpips]` left over from the
+        # file it was copied from. It therefore TRAINED on the oracle mask and
+        # was EVALUATED on the deployable one, and the resulting -0.129 dB was
+        # read as "the deployable mask is uninformative" when it was a train/test
+        # mask mismatch. Nothing in either log distinguished the two: both print
+        # the manifest path, and neither prints the planes.
+        #
+        # Selecting a subset of a multi-plane manifest is still possible -- the
+        # list just has to be a subset of what the manifest recorded, so the
+        # manifest name never stops describing the run.
+        want = list(mask_types) if mask_types else list(m["mask_types"])
+        extra = [t for t in want if t not in m["mask_types"]]
+        if extra:
+            raise ValueError(
+                f"mask_types={want} asks for {extra}, which "
+                f"{self.manifest_path.name} does not record (it has "
+                f"{m['mask_types']}). The manifest is the authority: point the "
+                "config at a manifest built for these planes, or drop the "
+                "config's dataset.mask_types and inherit the manifest's.")
+        self.mask_types = want
         self.gamma = float(gamma)
         if pooling != "max":
             # Hard rule 6 in production. `mean` exists so the rule can be an
