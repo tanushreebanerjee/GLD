@@ -426,6 +426,21 @@ def main() -> int:
                          "`render` scores the same, the slot is being ignored.\n"
                          "  shuffled - ANOTHER sample's render. Negative control: "
                          "invariance means ignored, corruption means genuinely read.")
+    ap.add_argument("--bridge-x0", action="store_true",
+                    help="LATENT BRIDGE MATCHING at sampling time: start the ODE "
+                         "at the artifact features instead of at N(0, I). REQUIRED "
+                         "for a checkpoint trained with --geofix-bridge-x0 and "
+                         "WRONG for any other -- a bridge model sampled from noise "
+                         "returns a bad number rather than an error. Needs the "
+                         "render, so it implies --cond-source render's artifact "
+                         "images being loaded (they always are).")
+    ap.add_argument("--bridge-noise-tau", type=float, default=0.0,
+                    help="Start-noise scale for --bridge-x0. Set it to the value "
+                         "the checkpoint trained with (geofix.bridge_noise_tau).")
+    ap.add_argument("--bridge-mask-noise", action="store_true",
+                    help="THE MASK-MODULATED BRIDGE at sampling time: sigma_i = "
+                         "tau * M_edit_i per token, matching training. Needs "
+                         "--bridge-x0, a positive --bridge-noise-tau and a mask.")
     ap.add_argument("--blend-mask", action="store_true",
                     help="Composite toward the render's features at every ODE step, "
                          "weighted by M_edit -- session 6.5's training-free mechanism, "
@@ -716,6 +731,10 @@ def main() -> int:
                 # dataset rather than a random one so the arm is reproducible.
                 art = build_batch(dataset[(i + 1) % n], device)["image"]
         msk = batch["mask"] if args.mask_in_camera else None
+        # The mask-modulated bridge needs the mask even with slot 2 OFF --
+        # that combination is the arm that isolates the transport schedule
+        # from the input channel.
+        msk_bridge = batch["mask"] if args.bridge_mask_noise else None
         if msk is not None and msk.shape[2] != 1:
             raise ValueError(
                 f"camera-channel injection takes ONE mask plane, manifest stacks "
@@ -798,6 +817,14 @@ def main() -> int:
             cfg_scale=ctx["cfg_scale"], use_camera_drop=ctx["use_camera_drop"],
             cfg_uncond_mode=ctx["cfg_uncond_mode"], batch=geo_batch,
             geofix_artifact_images=art, geofix_mask=msk,
+            # A bridge-trained checkpoint has to be SAMPLED as a bridge. These
+            # must match the flags the checkpoint was trained with; there is no
+            # way to read them off the .pt, so they are stated on the command
+            # line and recorded in the provenance.
+            geofix_bridge_x0=args.bridge_x0,
+            geofix_bridge_noise_tau=args.bridge_noise_tau,
+            geofix_bridge_mask_noise=args.bridge_mask_noise,
+            geofix_bridge_mask=msk_bridge,
         )
         feat_denorm[1] = rae._denormalize(feat[1])
 
@@ -942,6 +969,12 @@ def main() -> int:
         "samples_skipped_complete": skipped,
         "dump_depth": bool(args.dump_depth),
         "blend_mask": bool(args.blend_mask),
+        # There is no way to recover these from the checkpoint file, so a
+        # mismatch between how a bridge was trained and how it was sampled
+        # would be unrecoverable after the fact. Record them.
+        "bridge_x0": bool(args.bridge_x0),
+        "bridge_noise_tau": float(args.bridge_noise_tau),
+        "bridge_mask_noise": bool(args.bridge_mask_noise),
         "cond_artifact": bool(args.cond_artifact),
         "mask_in_camera": bool(args.mask_in_camera),
         "mask_types": list(manifest["mask_types"]),

@@ -132,6 +132,20 @@ def get_denoised_features(
     # conditioning and they have to agree exactly.
     geofix_artifact_images=None,  # (B, V, 3, H, W) 3DGS renders -> condition slot
     geofix_mask=None,             # (B, V, 1, g, g) M_edit on the token grid
+    # LATENT BRIDGE MATCHING. A bridge-trained checkpoint MUST be sampled from the
+    # artifact features, not from noise: it never learned a velocity field out of
+    # N(0, I). Scoring one on the stock noise start does not error, it just returns
+    # a bad number -- the same class of silent failure as the double-normalisation
+    # bug. These three mirror the training flags one-for-one and must be set to
+    # the SAME values the checkpoint was trained with.
+    geofix_bridge_x0=False,        # start at F_artifact instead of N(0, I)
+    geofix_bridge_noise_tau=0.0,   # sigma for the start perturbation
+    geofix_bridge_mask_noise=False,  # sigma_i = tau * M_edit_i, per token
+    # The mask used for the BRIDGE, kept separate from `geofix_mask` (slot 2, the
+    # camera channel) so {mask as input} x {mask as transport schedule} stays a
+    # 2x2. Passing `geofix_mask` here instead would silently switch slot 2 on for
+    # every mask-modulated bridge arm and make the two injections inseparable.
+    geofix_bridge_mask=None,
 ):
     """
     Diffusion sampling to generate denoised features at a single level.
@@ -249,7 +263,47 @@ def get_denoised_features(
     # Prepare sample input: ALL views start as noise at t=1 (matching training)
     # In training, x0 (noise) is sampled for ALL views, not just target views
     # The model learns to denoise all views from noise → clean features
-    sample_input_flat = torch.randn(B * V, C_lat, h_lat, w_lat, device=device, dtype=latents_all.dtype)
+    if geofix_bridge_x0:
+        # THE BRIDGE START. Mirrors train_multiview_da3.py's x0_init exactly,
+        # including the renormalisation, because the sampler must begin on the
+        # distribution the velocity field was fitted on.
+        #
+        # All V views, not just the targets: in concat mode training does not
+        # clamp the reference half either (`if is_concat_mode:` concatenates and
+        # returns), so every view's x0 was the artifact latent there too. In the
+        # reference slots that latent is a CLEAN photograph's, since the GeoFix
+        # loader fills [0, cond_num) with training photographs.
+        if geofix_artifact_images is None:
+            raise ValueError(
+                "geofix_bridge_x0 is set but no artifact images were given, so "
+                "there is nothing to bridge from. Falling back to noise would "
+                "score a bridge-trained checkpoint on a start it never saw.")
+        if geofix_bridge_mask_noise:
+            bridge_mask = geofix_bridge_mask if geofix_bridge_mask is not None else geofix_mask
+            if bridge_mask is None:
+                raise ValueError(
+                    "geofix_bridge_mask_noise needs a mask; without it sigma_i "
+                    "is undefined and a constant sigma is a DIFFERENT arm.")
+            if geofix_bridge_noise_tau <= 0:
+                raise ValueError(
+                    f"geofix_bridge_mask_noise with tau={geofix_bridge_noise_tau}: "
+                    "sigma would be 0 everywhere, i.e. the unmodulated bridge.")
+            m = bridge_mask.to(device=device, dtype=latents_art.dtype)
+            m = m.reshape(B * V, 1, m.shape[-2], m.shape[-1])
+            if m.shape[-2:] != (h_lat, w_lat):
+                raise ValueError(
+                    f"mask grid {tuple(m.shape[-2:])} != latent grid "
+                    f"{(h_lat, w_lat)}; the mask is MAX-pooled to the token grid "
+                    "and must match it exactly (hard rule 6).")
+            sigma = geofix_bridge_noise_tau * m
+        else:
+            sigma = float(geofix_bridge_noise_tau)
+        art_flat = latents_art.reshape(B * V, C_lat, h_lat, w_lat)
+        sample_input_flat = (
+            art_flat + torch.randn_like(art_flat) * sigma
+        ) / (1 + sigma ** 2) ** 0.5
+    else:
+        sample_input_flat = torch.randn(B * V, C_lat, h_lat, w_lat, device=device, dtype=latents_all.dtype)
     
     # Model kwargs
     model_kwargs = dict(
