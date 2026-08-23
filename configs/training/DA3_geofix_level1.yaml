@@ -89,6 +89,42 @@ geofix:
   # zeroes camera channels 1: and keeps 0.
   mask_in_camera: true
 
+  # ------------------------------------------------------------------------
+  # What the flow is supervised TOWARD. `gt_inp` from the GeoFix loader is the
+  # ARTIFACT RENDER and `gt_clean` is the clean photograph, so this is not a
+  # formality: with it unset and `cond_artifact` off, the model is trained to
+  # REPRODUCE 3DGS artifacts. Left null here = the historical default (on iff
+  # cond_artifact or bridge_x0 is on), so this config is unchanged. The NVS
+  # control sets it explicitly via --geofix-clean-target.
+  # ------------------------------------------------------------------------
+  clean_target: null
+
+  # ------------------------------------------------------------------------
+  # LATENT BRIDGE MATCHING. null = stock: x0 ~ N(0, I), the noise start GLD
+  # stage 2 was trained with. 'artifact' = x0 is the level-1 features of the
+  # render, so the flow learns F_artifact -> F_clean.
+  #
+  # NOT the img2img trick killed on 2026-08-16 -- that anchored a NOISE-trained
+  # sampler at artifact features it had never seen. Here training and sampling
+  # agree by construction.
+  #
+  # bridge_noise_tau perturbs the start, sigma ~ |N(0, tau^2)| then renormalised,
+  # because a noiseless bridge makes the t=1 map deterministic and the flow
+  # objective degenerates toward regression. Separate from
+  # training.noise_tau_gt_feat so a bridge run cannot inherit a value tuned for
+  # GLD's cross-level flow.
+  # ------------------------------------------------------------------------
+  bridge_x0: null
+  bridge_noise_tau: 0.1
+
+  # THE MASK-MODULATED BRIDGE. sigma_i = bridge_noise_tau * M_edit_i, so the start
+  # is deterministic where the mask says "clean, preserve" and noisy where it says
+  # "damaged, repair". This is the one mask injection that is SPECIFIC to a bridge:
+  # with a noise x0 there is no per-token transport distance to modulate. Needs
+  # bridge_x0=artifact and bridge_noise_tau > 0; independent of mask_in_camera, so
+  # {input, start-noise} is a 2x2 rather than one flag.
+  bridge_mask_noise: false
+
 transport:
   params:
     path_type: 'Linear'

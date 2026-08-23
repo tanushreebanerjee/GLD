@@ -84,6 +84,8 @@ def prepare_data(
     return_scale: bool = False,
     artifact_images=None,
     geofix_mask=None,
+    cond_artifact: bool = True,
+    return_artifact: bool = False,
 ):
     """
     Prepare data for training.
@@ -105,6 +107,20 @@ def prepare_data(
             here". Replaces the constant 1.0 that target views carry in camera
             channel 0. Nearest-upsampled to (H, W) so each token maps onto its own
             14x14 patch and survives the camera_embedder's patchify exactly.
+
+        cond_artifact: whether `artifact_images` fills `latents_cond[:, cond_num:]`.
+            Split out from `artifact_images` so LATENT BRIDGE MATCHING can ask for
+            the artifact latents WITHOUT the conditioning slot -- a pure bridge
+            (x0 = artifact features, nothing in slot 1) is the arm that says
+            whether the bridge REPLACES conditioning or merely accompanies it.
+            Default True, which is exactly the pre-bridge behaviour.
+
+        return_artifact: append `latents_art` to the return tuple. It is encoded
+            here, in the SAME normalised space as `latents_all` (that is the whole
+            reason it is computed inside this function rather than at the call
+            site), and a bridge whose x0 lives in a different space than its x1 is
+            the failure mode this project keeps catching. Returning it is strictly
+            cheaper and safer than re-encoding in the training loop.
     """
     # B, V, C, H, W = images.shape # Removed resize logic as per user request
     B, V, C, H, W = images.shape
@@ -292,7 +308,7 @@ def prepare_data(
             latents_ref_5d = latents_ref.reshape(B, cond_views, C_lat, seq_len, 1)
             latents_cond_5d[:, :cond_views] = latents_ref_5d
         # GeoFix slot 1: the target half stops being zeros and carries the render.
-        if latents_art is not None:
+        if latents_art is not None and cond_artifact:
             latents_cond_5d[:, cond_views:] = latents_art.reshape(
                 B, V, C_lat, seq_len, 1)[:, cond_views:]
         latents_cond = latents_cond_5d.reshape(BV, C_lat, seq_len, 1)
@@ -304,11 +320,19 @@ def prepare_data(
             latents_ref_5d = latents_ref.reshape(B, cond_views, C_lat, h_lat, w_lat)
             latents_cond_5d[:, :cond_views] = latents_ref_5d
         # GeoFix slot 1: the target half stops being zeros and carries the render.
-        if latents_art is not None:
+        if latents_art is not None and cond_artifact:
             latents_cond_5d[:, cond_views:] = latents_art.reshape(
                 B, V, C_lat, h_lat, w_lat)[:, cond_views:]
         latents_cond = latents_cond_5d.reshape(BV, C_lat, h_lat, w_lat)
 
+    if return_artifact:
+        if latents_art is None:
+            raise ValueError(
+                "return_artifact=True but artifact_images was not given, so there "
+                "are no artifact latents to bridge from. Returning None here would "
+                "make the caller silently fall back to a noise x0 -- i.e. train a "
+                "plain flow model under a bridge config.")
+        return latents_cond, latents_all, camera_embedding, latents_art
     return latents_cond, latents_all, camera_embedding
 
 def make_vis_multiview(gt, recon):
@@ -554,7 +578,142 @@ def main(args):
                 "cond-ON config; passing it to a cond-OFF config means one of the "
                 "two is not what you think it is.")
         geofix_cond_artifact = False
-    if (geofix_cond_artifact or geofix_mask_in_camera) and dataset_name.lower() != "geofix":
+    # ----------------------------------------------------------------------
+    # LATENT BRIDGE MATCHING. `geofix.bridge_x0: artifact` moves the x0 end of the
+    # flow from `randn_like(x1)` to the ARTIFACT features, so the model learns
+    # F_artifact -> F_clean instead of noise -> F_clean.
+    #
+    # Why this is a two-line change and not a new transport: `Transport.sample`
+    # already takes `x0_override` and `training_multiview_losses` already takes
+    # `x0=` (GLD uses them for its CROSS-LEVEL flow, `training.source_level`).
+    # What is new here is same-level, different-image: x0 and x1 are both level-1
+    # features, of the render and of the clean photograph respectively.
+    #
+    # NOISE. A noiseless bridge makes the map deterministic at t=1 and the flow
+    # objective degenerates toward regression, so `geofix.bridge_noise_tau`
+    # perturbs the start exactly the way GLD's own cross-level path does:
+    # `x0 = (F_art + sigma*eps) / sqrt(1 + sigma^2)`, sigma ~ |N(0, tau^2)|. It is
+    # a SEPARATE knob from `training.noise_tau_gt_feat` so a bridge run cannot
+    # silently inherit a value tuned for the cross-level path.
+    #
+    # This is NOT the img2img trick that 2026-08-16 killed. That one anchored a
+    # SAMPLER trained on `x_t = (1-t) F_clean + t eps` at artifact features it had
+    # never seen, and lost ~1.2 dB the moment t left 1.0. Here the training path
+    # and the sampling path agree by construction; whether that is worth anything
+    # is the question, and it is why `CLAUDE.md` recorded bridge matching as set
+    # aside for ABSENCE of evidence rather than ruled out.
+    # ----------------------------------------------------------------------
+    geofix_bridge_x0 = geofix_cfg.get("bridge_x0", None)
+    if getattr(args, "geofix_bridge_x0", None) is not None:
+        geofix_bridge_x0 = args.geofix_bridge_x0
+    if getattr(args, "geofix_no_bridge_x0", False):
+        if not geofix_bridge_x0:
+            raise ValueError(
+                "--geofix-no-bridge-x0 given but geofix.bridge_x0 is already unset. "
+                "The flag exists to run the noise-x0 control off the BRIDGE config "
+                "so nothing else can differ between the two arms.")
+        geofix_bridge_x0 = None
+    if geofix_bridge_x0 not in (None, "", "artifact"):
+        raise ValueError(
+            f"geofix.bridge_x0={geofix_bridge_x0!r}; the only implemented value is "
+            "'artifact' (x0 = level-1 features of the 3DGS render).")
+    geofix_bridge = geofix_bridge_x0 == "artifact"
+    geofix_bridge_noise_tau = float(geofix_cfg.get("bridge_noise_tau", 0.0))
+    # ------------------------------------------------------------------
+    # THE MASK-MODULATED BRIDGE, and why it is a different experiment from
+    # `mask_in_camera`.
+    #
+    # Slot 2 hands the mask to the network as an INPUT and lets it decide what to
+    # do with it. Across four checkpoints that has been worth <= +0.065 dB, and
+    # the leading explanation is redundancy: slot 1 already supplies the render,
+    # which contains the damage the mask points at.
+    #
+    # A bridge gives the mask a job no input channel can do. The start of the
+    # flow is now the render, so "how far does this token have to travel" is a
+    # real per-token quantity -- and the mask is a guess at it. Scaling the START
+    # NOISE by M_edit makes that guess structural rather than advisory:
+    #
+    #     sigma_i = tau * M_edit_i
+    #     x0_i    = (F_art_i + sigma_i * eps_i) / sqrt(1 + sigma_i^2)
+    #
+    # M=0 ("clean, preserve here") gives a deterministic start the model can copy;
+    # M=1 ("damaged, repair here") gives a noisy one it must generate through. It
+    # is REPRODUCIBLE AT INFERENCE -- unlike anything that mixes in F_clean --
+    # because the mask and the render are both available at test time, which is
+    # the constraint that rules out the obvious alternatives.
+    #
+    # Independent of `mask_in_camera`: the 2x2 of {input, start-noise} is the
+    # ablation, and collapsing them into one flag would make it unrunnable.
+    # ------------------------------------------------------------------
+    geofix_bridge_mask_noise = bool(geofix_cfg.get("bridge_mask_noise", False))
+    if getattr(args, "geofix_bridge_mask_noise", False):
+        geofix_bridge_mask_noise = True
+    if getattr(args, "geofix_no_bridge_mask_noise", False):
+        if not geofix_bridge_mask_noise:
+            raise ValueError(
+                "--geofix-no-bridge-mask-noise given but geofix.bridge_mask_noise is "
+                "already false. The flag exists to run the control off the SAME "
+                "config as the mask-modulated arm.")
+        geofix_bridge_mask_noise = False
+    if geofix_bridge_mask_noise:
+        if not geofix_bridge:
+            raise ValueError(
+                "geofix.bridge_mask_noise needs geofix.bridge_x0=artifact: with a "
+                "noise x0 there is no per-token transport distance to modulate, and "
+                "scaling the noise would just be a spatially varying SNR.")
+        if geofix_bridge_noise_tau <= 0:
+            raise ValueError(
+                f"geofix.bridge_mask_noise is on but bridge_noise_tau="
+                f"{geofix_bridge_noise_tau}; sigma_i = tau * M_edit_i would be 0 "
+                "everywhere and the arm would be a plain deterministic bridge.")
+    # `source_level` is parsed further down (line ~638), so read it from the config
+    # here rather than from the not-yet-bound local.
+    if geofix_bridge and training_cfg.get("source_level", None) is not None:
+        raise ValueError(
+            "geofix.bridge_x0 and training.source_level both write the x0 end of "
+            "the flow; the second would overwrite the first and the run would look "
+            "like a bridge while being a cross-level flow. Pick one.")
+    if geofix_bridge and geofix_bridge_noise_tau < 0:
+        raise ValueError(
+            f"geofix.bridge_noise_tau={geofix_bridge_noise_tau} must be >= 0.")
+
+    # ----------------------------------------------------------------------
+    # WHAT THE FLOW IS SUPERVISED TOWARD -- and the bug this flag exists to fix.
+    #
+    # `image = batch['gt_inp']`, and from the GeoFix loader `gt_inp` is the
+    # ARTIFACT RENDER. The clean photograph is a separate key, `gt_clean`. Until
+    # 2026-08-22 the swap to `gt_clean` fired ONLY when slot 1 was on, so
+    # `--geofix-no-cond-artifact` did not merely remove the conditioning: it
+    # silently moved the flow TARGET from the clean photograph to the degraded
+    # render. Both `maskonly_*` runs (7292471/7292472) trained that way. They are
+    # therefore "GLD finetuned to REPRODUCE 3DGS artifacts", which is not the
+    # ft-only control anyone reading their name would assume, and the mistake is
+    # invisible in every metric -- a model that reproduces the render scores
+    # exactly as well as the render.
+    #
+    # `clean_target` is now explicit. It defaults to the historical behaviour
+    # (on iff slot 1 or the bridge is on) so no completed run is reinterpreted,
+    # and `--geofix-clean-target` turns it on independently. THE NVS CONTROL --
+    # plain GLD finetuned on our 20 DL3DV scenes, no render conditioning, no mask,
+    # supervised toward clean novel views -- is exactly
+    #     --geofix-no-cond-artifact --geofix-no-mask --geofix-clean-target
+    # and it is the baseline that separates "finetuning on this data" from "the
+    # conditioning signal" in every session-8/9 number.
+    # ----------------------------------------------------------------------
+    geofix_clean_target = geofix_cfg.get("clean_target", None)
+    if getattr(args, "geofix_clean_target", False):
+        geofix_clean_target = True
+    if geofix_clean_target is None:
+        geofix_clean_target = geofix_cond_artifact or geofix_bridge
+    geofix_clean_target = bool(geofix_clean_target)
+    if (geofix_cond_artifact or geofix_bridge) and not geofix_clean_target:
+        raise ValueError(
+            "geofix.clean_target=false with cond_artifact/bridge_x0 on would "
+            "condition the model on the render AND supervise it toward the render, "
+            "i.e. train an identity map that scores like the input.")
+
+    if (geofix_cond_artifact or geofix_mask_in_camera or geofix_bridge
+            or geofix_clean_target) and dataset_name.lower() != "geofix":
         raise ValueError(
             f"geofix.* conditioning is on but dataset.name={dataset_name!r}. "
             "Only the GeoFix loader supplies 'gt_clean' and 'mask'.")
@@ -717,6 +876,12 @@ def main(args):
     model_config.params.cam_in_channels = cam_in_channels
     if rank == 0:
         logger.info(f"Camera mode: {camera_mode}, cam_in_channels: {cam_in_channels}")
+        logger.info(
+            f"[GeoFix] flow target = "
+            f"{'gt_clean (clean photograph)' if geofix_clean_target else 'gt_inp (ARTIFACT RENDER)'}"
+            f"  bridge_x0={geofix_bridge_x0 or 'noise'}"
+            f"  bridge_noise_tau={geofix_bridge_noise_tau}"
+            f"  bridge_mask_noise={geofix_bridge_mask_noise}")
         logger.info(f"[GeoFix] cond_artifact={geofix_cond_artifact} "
                     f"mask_in_camera={geofix_mask_in_camera}")
 
@@ -1152,19 +1317,35 @@ def main(args):
             # ------------------------------------------------------------------
             artifact_images = None
             geofix_mask = None
-            if geofix_cond_artifact:
+            # The swap is the same for slot 1 and for the bridge -- both need the
+            # render encoded and the CLEAN frame as the flow target -- so it fires
+            # once for either, and never twice.
+            if geofix_clean_target:
                 if 'gt_clean' not in batch:
                     raise ValueError(
-                        "geofix.cond_artifact=true but the batch has no 'gt_clean'. "
+                        "geofix.clean_target is on but the batch has no 'gt_clean'. "
                         "Only the GeoFix loader supplies it; check dataset.name=geofix.")
                 artifact_images = image      # the render, -> latents_cond target slots
                 image = batch['gt_clean']    # the clean frame, -> flow target
-            if geofix_mask_in_camera:
+            if not (geofix_cond_artifact or geofix_bridge):
+                # Nothing consumes the render: no slot-1 fill, no bridge x0. Keep it
+                # out of prepare_data so the encode is not paid for and the arm is
+                # provably render-free.
+                artifact_images = None
+            # `geofix_mask` is what reaches prepare_data (slot 2). The bridge's
+            # start-noise modulation needs the SAME tensor but must not turn slot 2
+            # on, so it is bound separately -- the 2x2 of {input, start-noise} only
+            # exists if those two are independently controllable.
+            geofix_mask_tokens = None
+            if geofix_mask_in_camera or geofix_bridge_mask_noise:
                 if 'mask' not in batch:
                     raise ValueError(
-                        "geofix.mask_in_camera=true but the batch has no 'mask'. "
-                        "Only the GeoFix loader supplies it; check dataset.name=geofix.")
-                geofix_mask = batch['mask']
+                        "geofix.mask_in_camera / geofix.bridge_mask_noise is on but "
+                        "the batch has no 'mask'. Only the GeoFix loader supplies "
+                        "it; check dataset.name=geofix.")
+                geofix_mask_tokens = batch['mask']
+            if geofix_mask_in_camera:
+                geofix_mask = geofix_mask_tokens
 
             # ------------------------------------------------------------------
             # Fail loudly on view-count mismatches (critical for multiview runs)
@@ -1198,19 +1379,31 @@ def main(args):
             
             if predict_cls:
                 # For now, following user's strict return signature.
-                x1_cond, x1_all, camera_embedding = prepare_data(
+                _prep = prepare_data(
                     rae, image, intrinsic, extrinsic, device,
                     random_cond_num=batch_cond_num, return_cls=True,
                     camera_mode=camera_mode, return_scale=use_prope,
-                    artifact_images=artifact_images, geofix_mask=geofix_mask
+                    artifact_images=artifact_images, geofix_mask=geofix_mask,
+                    cond_artifact=geofix_cond_artifact, return_artifact=geofix_bridge
                 )
+                if geofix_bridge:
+                    x1_cond, x1_all, camera_embedding, geofix_latents_art = _prep
+                else:
+                    x1_cond, x1_all, camera_embedding = _prep
+                    geofix_latents_art = None
             else:
-                x1_cond, x1_all, camera_embedding = prepare_data(
+                _prep = prepare_data(
                     rae, image, intrinsic, extrinsic, device,
                     random_cond_num=batch_cond_num, return_cls=False,
                     camera_mode=camera_mode, return_scale=use_prope,
-                    artifact_images=artifact_images, geofix_mask=geofix_mask
+                    artifact_images=artifact_images, geofix_mask=geofix_mask,
+                    cond_artifact=geofix_cond_artifact, return_artifact=geofix_bridge
                 )
+                if geofix_bridge:
+                    x1_cond, x1_all, camera_embedding, geofix_latents_art = _prep
+                else:
+                    x1_cond, x1_all, camera_embedding = _prep
+                    geofix_latents_art = None
             
             # Ensure cond_num is set to actual sampled value for model_kwargs
             cond_num_for_model = int(batch_cond_num)
@@ -1362,6 +1555,75 @@ def main(args):
                 try:
                     # Feature-to-Feature Flow: Construct x0 from source features + noise
                     x0_init = None
+                    # GeoFix LATENT BRIDGE MATCHING. Same level, different image:
+                    # x0 = level-1 features of the RENDER, x1 = level-1 features of
+                    # the clean photograph. `latents_art` came out of prepare_data
+                    # so it is normalised identically to x1 -- re-encoding here
+                    # would be the one way to get that wrong.
+                    #
+                    # Only the TARGET half matters: training_multiview_losses
+                    # clamps views [0, cond_num) back to clean x1 regardless of x0
+                    # (`xt = th.where(target_mask, xt, x1_5d)`), so the reference
+                    # slots' x0 is discarded. Passing the whole tensor is therefore
+                    # correct AND inert on the reference half.
+                    if geofix_bridge:
+                        if geofix_latents_art is None:
+                            raise RuntimeError(
+                                "geofix.bridge_x0 is on but prepare_data returned no "
+                                "artifact latents; the run would fall back to a noise "
+                                "x0 and quietly not be a bridge.")
+                        if geofix_latents_art.shape != x1_cond.shape:
+                            raise ValueError(
+                                f"bridge x0 {tuple(geofix_latents_art.shape)} != x1 "
+                                f"{tuple(x1_cond.shape)}; the two ends of the flow "
+                                "must share a shape and a normalisation.")
+                        if geofix_bridge_mask_noise:
+                            # sigma_i = tau * M_edit_i -- a PER-TOKEN start noise.
+                            # tau is used directly here rather than resampled as
+                            # |N(0, tau^2)|: the mask is already the source of
+                            # variation across tokens, and multiplying it by a
+                            # per-step scalar would blur the very contrast the arm
+                            # is testing.
+                            if geofix_mask_tokens is None:
+                                raise RuntimeError(
+                                    "geofix.bridge_mask_noise is on but no mask "
+                                    "reached the training step.")
+                            m = geofix_mask_tokens.to(
+                                device=device, dtype=geofix_latents_art.dtype)
+                            if m.ndim != 5 or m.shape[2] != 1:
+                                raise ValueError(
+                                    f"mask must be (B, V, 1, g, g), got {tuple(m.shape)}.")
+                            if geofix_latents_art.ndim != 4 or geofix_latents_art.shape[-1] == 1:
+                                raise ValueError(
+                                    "bridge_mask_noise needs SPATIAL latents "
+                                    f"(BV, C, h, w); got {tuple(geofix_latents_art.shape)}. "
+                                    "In the packed CLS format there is no token grid "
+                                    "to align the mask to, and broadcasting would "
+                                    "silently scale the wrong axis.")
+                            m = m.reshape(-1, 1, m.shape[3], m.shape[4])
+                            if m.shape[-2:] != geofix_latents_art.shape[-2:]:
+                                raise ValueError(
+                                    f"mask grid {tuple(m.shape[-2:])} != latent grid "
+                                    f"{tuple(geofix_latents_art.shape[-2:])}; the mask is "
+                                    "MAX-pooled to the token grid at load time and must "
+                                    "match it exactly (hard rule 6).")
+                            sigma = geofix_bridge_noise_tau * m   # (BV, 1, h, w)
+                        elif geofix_bridge_noise_tau > 0:
+                            # sigma ~ |N(0, tau^2)|, then renormalise -- the exact
+                            # form GLD's cross-level path uses a few lines below, so
+                            # the two starts are perturbed comparably.
+                            sigma = torch.abs(
+                                torch.randn(1, device=device) * geofix_bridge_noise_tau
+                            ).item()
+                        else:
+                            sigma = 0.0
+                        # Written to broadcast over a scalar sigma AND a per-token
+                        # one; `sigma ** 2` and the division are elementwise either
+                        # way, so the two arms differ only in sigma's shape.
+                        x0_init = (
+                            geofix_latents_art
+                            + torch.randn_like(geofix_latents_art) * sigma
+                        ) / (1 + sigma ** 2) ** 0.5
                     if source_level is not None:
                         # Extract source level features WITH SOURCE-LEVEL NORMALIZATION
                         # CRITICAL: Source and target levels have DIFFERENT distributions!
@@ -1849,6 +2111,37 @@ if __name__ == "__main__":
                              "render is NOT supplied. Pairs with --geofix-no-mask "
                              "to give all four cells of the two-slot ablation off "
                              "ONE config file.")
+
+    parser.add_argument("--geofix-clean-target", action="store_true",
+                        help="Supervise the flow toward the CLEAN photograph even "
+                             "with both conditioning slots off. Without it, an arm "
+                             "run with --geofix-no-cond-artifact is supervised "
+                             "toward the ARTIFACT RENDER (`gt_inp`), which is how "
+                             "the two `maskonly_*` runs of 2026-08-20 came to be "
+                             "trained to reproduce 3DGS artifacts. Combine with "
+                             "--geofix-no-cond-artifact --geofix-no-mask for the NVS "
+                             "control: plain GLD finetuned on our DL3DV scenes, no "
+                             "render conditioning, no mask.")
+
+    parser.add_argument("--geofix-bridge-x0", default=None, choices=("artifact",),
+                        help="LATENT BRIDGE MATCHING. Start the flow at the level-1 "
+                             "features of the 3DGS render instead of at noise, so "
+                             "the model learns F_artifact -> F_clean. Overrides "
+                             "geofix.bridge_x0.")
+    parser.add_argument("--geofix-bridge-mask-noise", action="store_true",
+                        help="THE MASK-MODULATED BRIDGE: scale the bridge start "
+                             "noise per token by M_edit, so the flow starts "
+                             "deterministically where the mask says 'preserve' and "
+                             "noisily where it says 'repair'. Requires "
+                             "--geofix-bridge-x0 artifact. Overrides "
+                             "geofix.bridge_mask_noise.")
+    parser.add_argument("--geofix-no-bridge-mask-noise", action="store_true",
+                        help="Force geofix.bridge_mask_noise off so the unmodulated "
+                             "bridge control runs off the SAME config file as the "
+                             "mask-modulated arm.")
+    parser.add_argument("--geofix-no-bridge-x0", action="store_true",
+                        help="Force geofix.bridge_x0 off, so the noise-x0 control "
+                             "runs off the SAME config file as the bridge arm.")
 
     args = parser.parse_args()
     # Log level info
