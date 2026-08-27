@@ -2357,6 +2357,14 @@ def main(args):
                     geofix_bridge_noise_tau=geofix_bridge_noise_tau,
                     geofix_bridge_mask_noise=geofix_bridge_mask_noise,
                     geofix_blend_train=geofix_blend_train,
+                    # Passed, and validation deliberately does NOT apply it --
+                    # the gate reweights the loss and touches no input, so
+                    # applying it here would make `val/loss` a function of lambda
+                    # and destroy the canary's comparability across arms. The
+                    # reasoning lives at the parameter in `da3_validation.py`;
+                    # passing it is what keeps the choice on the record instead of
+                    # looking like the flag was forgotten.
+                    geofix_loss_keep_weight=geofix_loss_keep_weight,
                     geofix_blend_hook=geofix_blend_hook,
                 )
                 # remove images from printed log

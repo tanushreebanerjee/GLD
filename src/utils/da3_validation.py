@@ -100,6 +100,23 @@ def validate_da3_multiview(
     geofix_bridge_noise_tau=0.0,  # sigma for the bridge start perturbation
     geofix_bridge_mask_noise=False,  # sigma_i = tau * M_edit_i, per token
     geofix_blend_train=False,    # composite x_t toward F_render under the mask
+    # PHASE 3a, the mask-gated loss. ACCEPTED AND DELIBERATELY NOT APPLIED, which
+    # is why it is a named parameter rather than an omission.
+    #
+    # Every other flag here changes what the network is SHOWN -- x0's start, the
+    # conditioning slots, the camera plane -- so validation must reproduce it or
+    # it scores a different construction than the one that trained. The gate is
+    # not that kind of knob: it reweights the LOSS and touches no input. Applying
+    # it here would make `val/loss` a function of lambda and destroy the one
+    # property the canary needs, comparability ACROSS arms -- a lambda=3 arm
+    # would print a different val/loss from a lambda=1 arm for reasons that have
+    # nothing to do with model quality.
+    #
+    # It is named and defaulted so `tests/test_val_geofix_reflection.py` sees a
+    # parameter and this CHOICE is on the record, rather than the flag simply
+    # being absent -- which is indistinguishable from the F2 defect where
+    # validation silently fell three injection routes behind the trainer.
+    geofix_loss_keep_weight=0.0,
     # The armed `stage2.transport.blending.LatentBlend` the SAMPLER was built
     # with, when `geofix_blend_train` is on. It cannot be created here: the blend
     # is a `blend_fn` hook baked into `Sampler.sample_ode` at construction time,
