@@ -22,6 +22,7 @@ from PIL import Image
 from copy import deepcopy
 from glob import glob
 from time import time
+import json
 import argparse
 import itertools
 import logging
@@ -194,26 +195,23 @@ def prepare_data(
 
         # C. Merge: Reference part from 'ref-only' pass, Target part from 'all' pass
     # latents_all is (B*V, C, ...)
+    #
+    # `latents_cond` USED TO BE BUILT HERE TOO, and that copy was dead: the block
+    # near the end of this function ("Construct latents_cond") re-zeros and
+    # reassigns it unconditionally in BOTH the sequence and the spatial branch,
+    # so nothing between the two ever read the first result. Deleted 2026-08-27.
+    #
+    # It was not merely redundant. In the sequence branch the assignment sat
+    # INSIDE `if latents_ref is not None:`, so `cond_views == 0` plus the packed
+    # CLS format left `latents_cond` unbound and the next reader would have hit a
+    # NameError rather than a shaped error -- a latent crash that only the
+    # zero-reference configuration could trigger, which is exactly the
+    # configuration nothing in session 8 runs. Removing the block removes the
+    # trap; the surviving block zero-initialises before the `if`, so it is safe
+    # at cond_views == 0.
+    #
+    # `BV` stays: the surviving block and the CLS reshapes below both read it.
     BV = latents_all.shape[0]
-    # Handle both spatial (4D) and sequence (4D with last dim 1) formats
-    if latents_all.ndim == 4 and latents_all.shape[3] == 1:
-        # Sequence format (with CLS)
-        _, C_lat, N_plus_1, _ = latents_all.shape
-        latents_all_5d = latents_all.reshape(B, V, C_lat, N_plus_1, 1)
-        latents_cond_5d = torch.zeros(B, V, C_lat, N_plus_1, 1, device=device, dtype=latents_all.dtype)
-        if latents_ref is not None:
-            latents_ref_5d = latents_ref.reshape(B, cond_views, C_lat, N_plus_1, 1)
-            latents_cond_5d[:, :cond_views] = latents_ref_5d
-            latents_cond = latents_cond_5d.reshape(BV, C_lat, N_plus_1, 1)
-    else:
-        # Spatial format
-        _, C_lat, h_lat, w_lat = latents_all.shape
-        latents_all_5d = latents_all.reshape(B, V, C_lat, h_lat, w_lat)
-        latents_cond_5d = torch.zeros(B, V, C_lat, h_lat, w_lat, device=device, dtype=latents_all.dtype)
-        if latents_ref is not None:
-            latents_ref_5d = latents_ref.reshape(B, cond_views, C_lat, h_lat, w_lat)
-            latents_cond_5d[:, :cond_views] = latents_ref_5d
-        latents_cond = latents_cond_5d.reshape(BV, C_lat, h_lat, w_lat)
 
     # 2. get camera embedding at IMAGE resolution
     # The camera_embedder in DiT model will patchify this to match latent size
@@ -380,6 +378,26 @@ def main(args):
         multiview_config,
         dataset_config,
     ) = parse_configs(args.config)
+    # ------------------------------------------------------------------
+    # SCENE-COUNT SCALING CURVE. Each point trains on a different SUBSET of the
+    # same manifest, so the manifest is the one thing that must vary between arms
+    # -- and copying the config per arm is the drift hazard the --geofix-no-mask
+    # comment warns about: a second file lets anything else move with it.
+    #
+    # This is applied to `dataset_config` AFTER parse_configs, which is why a
+    # generic `--set dataset.manifest=...` would not work: parse_configs re-reads
+    # the config from disk, so an override on `cfg` never reaches this object.
+    # `val_manifest` is deliberately NOT touched -- every point on the curve must
+    # be validated against the identical held-out set or the curve is not a curve.
+    # ------------------------------------------------------------------
+    if getattr(args, "geofix_manifest", None):
+        if dataset_config is None:
+            raise ValueError("--geofix-manifest given but the config has no dataset block.")
+        if not Path(args.geofix_manifest).is_file():
+            raise ValueError(f"--geofix-manifest {args.geofix_manifest} does not exist.")
+        print(f"[GeoFix] train manifest OVERRIDE: {dataset_config.get('manifest')} "
+              f"-> {args.geofix_manifest}")
+        dataset_config["manifest"] = args.geofix_manifest
     # Initialize derived config defaults (auto-compute input_size, cam_*, latent_size, etc.)
     # Supports 2D encoder sizes (H, W)
     # Note: init_config_defaults returns RAE encoder size. We use this as default for dataloader
@@ -655,6 +673,81 @@ def main(args):
                 "already false. The flag exists to run the control off the SAME "
                 "config as the mask-modulated arm.")
         geofix_bridge_mask_noise = False
+    # ------------------------------------------------------------------
+    # LATENT BLENDING AT TRAINING TIME -- the third, and most literal, way the
+    # mask can enter. Session 6.5's blend composites x_t toward F_artifact at
+    # every solver step; there is no solver loop in training, but under a BRIDGE
+    # the composite has an exact single-shot form, t_i = 1 - M_i (1 - t). The
+    # derivation is in transport.training_multiview_losses, at the point of use.
+    #
+    # It needs a bridge for a reason that is not a technicality: with x0 ~ N(0, I)
+    # the same algebra gives a spatially varying SNR, not a transport schedule.
+    # ------------------------------------------------------------------
+    # PHASE 3a: the mask-gated loss. lambda = 0 is bit-for-bit the unweighted
+    # loss, so this is inert unless asked for.
+    geofix_loss_keep_weight = float(geofix_cfg.get("loss_keep_weight", 0.0) or 0.0)
+    if getattr(args, "geofix_loss_keep_weight", None) is not None:
+        geofix_loss_keep_weight = float(args.geofix_loss_keep_weight)
+    if geofix_loss_keep_weight < 0:
+        raise ValueError(
+            f"geofix.loss_keep_weight={geofix_loss_keep_weight} must be >= 0. A "
+            "negative lambda would DOWNWEIGHT the preserve region -- the direction "
+            "this project's own loss-split diagnostic says suppresses the "
+            "behaviour we lack.")
+
+    geofix_blend_train = bool(geofix_cfg.get("blend_train", False))
+    if getattr(args, "geofix_blend_train", False):
+        geofix_blend_train = True
+    if getattr(args, "geofix_no_blend_train", False):
+        if not geofix_blend_train:
+            raise ValueError(
+                "--geofix-no-blend-train given but geofix.blend_train is already "
+                "false. The flag exists to run the control off the SAME config.")
+        geofix_blend_train = False
+    # It does NOT require a bridge. The composite targets the ARTIFACT latents --
+    # passed to the transport as `geofix_blend_toward` rather than read off x0 --
+    # which under a bridge happen to BE x0. Under the stock noise start it is
+    # literally session 6.5's blend moved into the training loop, and that is the
+    # direct test of why `geofix_blend_s29500` lost 0.457 dB: the model met the
+    # composite for the first time at inference. Only the `t_i = 1 - M_i (1-t)`
+    # reading is bridge-specific, not the operation.
+
+    # ------------------------------------------------------------------
+    # A MASK-CONSUMING ARM MAY NOT RUN ON A MASK-FREE MANIFEST.
+    #
+    # `geofix.train_manifest --coverage no_mask` builds sample lists over an
+    # export tree that has no masks at all (the 100-scene scale-up,
+    # `configs/data/dl3dv_scale100.yaml`), and records `masks_on_disk: false` to
+    # say so. `GeoFixPairs._mask` returns ZEROS wherever `has_mask` is false, so
+    # such a manifest is silently loadable by every mask arm -- and under `edit1`
+    # an all-zero plane reads as "clean, preserve everywhere" on a frame the loss
+    # then demands a repair of. That is contradictory supervision on 100% of
+    # samples, and the only symptom would be a disappointing number that reads as
+    # "the mask does not help at 100 scenes".
+    #
+    # Nothing else catches it: the manifest loads, the shapes are right, the
+    # polarity field is right, and n_mask matches.
+    # ------------------------------------------------------------------
+    _mask_consumers = [n for n, on in (
+        ("geofix.mask_in_camera", geofix_mask_in_camera),
+        ("geofix.bridge_mask_noise", geofix_bridge_mask_noise),
+        ("geofix.blend_train", geofix_blend_train),
+        ("geofix.loss_keep_weight", geofix_loss_keep_weight != 0.0),
+    ) if on]
+    if _mask_consumers and (dataset_config or {}).get("name") == "geofix":
+        _mpath = (dataset_config or {}).get("manifest")
+        if _mpath and Path(_mpath).is_file():
+            _m = json.loads(Path(_mpath).read_text())
+            if _m.get("masks_on_disk", True) is False:
+                raise ValueError(
+                    f"{', '.join(_mask_consumers)} is on, but {Path(_mpath).name} was "
+                    f"built with coverage={_m.get('coverage')!r} and records "
+                    "masks_on_disk: false -- there is no mask file behind ANY of its "
+                    f"{len(_m.get('samples', []))} samples. Every target would get an "
+                    "all-zero plane, which under edit1 means 'clean, preserve here' "
+                    "while the loss still demands a repair. Compute masks for this "
+                    "tree, or run the arm with --geofix-no-mask.")
+
     if geofix_bridge_mask_noise:
         if not geofix_bridge:
             raise ValueError(
@@ -704,13 +797,21 @@ def main(args):
     if getattr(args, "geofix_clean_target", False):
         geofix_clean_target = True
     if geofix_clean_target is None:
-        geofix_clean_target = geofix_cond_artifact or geofix_bridge
+        # `blend_train` belongs in this default for the same reason the other two
+        # do: it composites x_t toward the ARTIFACT latents, which `prepare_data`
+        # only produces when `artifact_images` is passed, which only happens under
+        # `geofix_clean_target`. Omitting it here (the state before 2026-08-27)
+        # did not merely mis-default -- a `blend_train: true` arm with
+        # cond_artifact and bridge_x0 both off died several hundred lines later
+        # inside `prepare_data` with "return_artifact=True but artifact_images was
+        # not given", which names the symptom and not the flag that caused it.
+        geofix_clean_target = geofix_cond_artifact or geofix_bridge or geofix_blend_train
     geofix_clean_target = bool(geofix_clean_target)
-    if (geofix_cond_artifact or geofix_bridge) and not geofix_clean_target:
+    if (geofix_cond_artifact or geofix_bridge or geofix_blend_train) and not geofix_clean_target:
         raise ValueError(
-            "geofix.clean_target=false with cond_artifact/bridge_x0 on would "
-            "condition the model on the render AND supervise it toward the render, "
-            "i.e. train an identity map that scores like the input.")
+            "geofix.clean_target=false with cond_artifact/bridge_x0/blend_train on "
+            "would condition the model on the render AND supervise it toward the "
+            "render, i.e. train an identity map that scores like the input.")
 
     if (geofix_cond_artifact or geofix_mask_in_camera or geofix_bridge
             or geofix_clean_target) and dataset_name.lower() != "geofix":
@@ -874,16 +975,69 @@ def main(args):
     if 'params' not in model_config:
         model_config.params = OmegaConf.create({})
     model_config.params.cam_in_channels = cam_in_channels
+
+    # ------------------------------------------------------------------
+    # THE RESOLVED GeoFix SETTINGS, IN ONE PLACE.
+    #
+    # Every flag above is the result of a three-way resolution -- config default,
+    # `geofix:` block, `--geofix-*` CLI override -- and until 2026-08-27 the ONLY
+    # record of the outcome was the banner printed a few lines below. A log line
+    # is a weak record: it lives beside the checkpoint rather than inside it, it
+    # is lost when a run directory is moved or pruned, and it cannot be read at
+    # all by anything holding only a `.pt` file. `arm_train_test_gate` had to
+    # regex it, and regexed exactly one flag out of eight.
+    #
+    # So this dict is built ONCE and used TWICE -- it is printed as the banner and
+    # stored in every checkpoint under the "geofix" key. Building it once is the
+    # point: a banner and a checkpoint field maintained separately would drift,
+    # and a parity gate reading a drifted record is worse than no gate. Anything
+    # added here must be added to `arm_train_test_gate.CHECKS` as well, which is a
+    # single dict entry by construction.
+    #
+    # `mask_types` / `pooling` / `gamma` come from the DATASET block, not the
+    # `geofix:` one, because they are applied at LOAD time by `GeoFixPairs`. An
+    # arm trained under one pooling and sampled under another is a different
+    # conditioning signal, and nothing downstream would notice.
+    # ------------------------------------------------------------------
+    _ds = dataset_config or {}
+    geofix_settings = {
+        "cond_artifact": bool(geofix_cond_artifact),
+        "mask_in_camera": bool(geofix_mask_in_camera),
+        "clean_target": bool(geofix_clean_target),
+        # The string, not the derived bool: 'artifact' / None. `geofix_bridge` is
+        # `== "artifact"`, so the string is the strictly more informative of the
+        # two and the gate can still derive the bool.
+        "bridge_x0": geofix_bridge_x0 or None,
+        "bridge_noise_tau": float(geofix_bridge_noise_tau),
+        "bridge_mask_noise": bool(geofix_bridge_mask_noise),
+        "blend_train": bool(geofix_blend_train),
+        "loss_keep_weight": float(geofix_loss_keep_weight),
+        "mask_types": list(_ds.get("mask_types", []) or []),
+        "pooling": _ds.get("pooling", "max"),
+        "gamma": float(_ds.get("gamma", 1.0)),
+    }
+
     if rank == 0:
         logger.info(f"Camera mode: {camera_mode}, cam_in_channels: {cam_in_channels}")
         logger.info(
             f"[GeoFix] flow target = "
-            f"{'gt_clean (clean photograph)' if geofix_clean_target else 'gt_inp (ARTIFACT RENDER)'}"
-            f"  bridge_x0={geofix_bridge_x0 or 'noise'}"
-            f"  bridge_noise_tau={geofix_bridge_noise_tau}"
-            f"  bridge_mask_noise={geofix_bridge_mask_noise}")
-        logger.info(f"[GeoFix] cond_artifact={geofix_cond_artifact} "
-                    f"mask_in_camera={geofix_mask_in_camera}")
+            f"{'gt_clean (clean photograph)' if geofix_settings['clean_target'] else 'gt_inp (ARTIFACT RENDER)'}"
+            f"  bridge_x0={geofix_settings['bridge_x0'] or 'noise'}"
+            f"  bridge_noise_tau={geofix_settings['bridge_noise_tau']}"
+            f"  bridge_mask_noise={geofix_settings['bridge_mask_noise']}"
+            f"  blend_train={geofix_settings['blend_train']}"
+            f"  loss_keep_weight={geofix_settings['loss_keep_weight']}")
+        logger.info(f"[GeoFix] cond_artifact={geofix_settings['cond_artifact']} "
+                    f"mask_in_camera={geofix_settings['mask_in_camera']}")
+        # The MASK's own three knobs. They are applied at LOAD time, so an arm
+        # trained with one and scored with another is a different conditioning
+        # signal that nothing downstream would notice -- the same parity gap the
+        # bridge_x0 gate exists to close. The gate now covers them, from the
+        # checkpoint; this line remains the only record for runs that predate the
+        # checkpoint field, which is why it stays.
+        logger.info(f"[GeoFix] mask_types={geofix_settings['mask_types']} "
+                    f"pooling={geofix_settings['pooling']} "
+                    f"gamma={geofix_settings['gamma']}")
 
     rae = instantiate_from_config(rae_config).to(device)
 
@@ -1162,11 +1316,50 @@ def main(args):
     )
     transport_sampler = Sampler(transport)
 
+    # ------------------------------------------------------------------
+    # THE VALIDATION BLEND HOOK. `blend_train` composites x_t toward the artifact
+    # latents inside `training_multiview_losses`; at SAMPLING time the same
+    # operation can only reach the trajectory through `sample_ode`'s `blend_fn`,
+    # which is baked in at construction. So the object is built here, once, and
+    # `validate_da3_multiview` re-arms it with each batch's own features and mask.
+    #
+    # Without it a blend-trained checkpoint would be validated on an UNBLENDED
+    # trajectory -- 776 complete views, no error, a plausible number, which is the
+    # exact failure mode `geofix.tools.arm_train_test_gate` was written for after
+    # it happened four times. Validation now refuses to run rather than produce
+    # that number (`geofix_blend_hook is None` raises there).
+    #
+    # `None` for every other arm, and `sample_ode(blend_fn=None)` is the stock
+    # path byte-for-byte (hard rule 9).
+    # ------------------------------------------------------------------
+    geofix_blend_hook = None
+    if geofix_blend_train:
+        if args.overfit:
+            # Pre-existing gap, not one this introduces: the `--overfit` branch of
+            # the dataloader setup above never binds `val_num_views` /
+            # `val_cond_num`, so the validation call at the bottom of this file
+            # would already NameError on them. Named here rather than allowed to
+            # surface as a NameError two thousand lines away.
+            raise NotImplementedError(
+                "--overfit with geofix.blend_train: the overfit branch does not "
+                "bind val_num_views/val_cond_num, so the blend hook cannot be told "
+                "which views are references -- and it MUST know, because M_edit is "
+                "forced to 1.0 there.")
+        from stage2.transport.blending import LatentBlend
+        geofix_blend_hook = LatentBlend(total_view=val_num_views, cond_num=val_cond_num)
+
     if sampler_mode == "ODE":
         # Original RAE code already flips time in ode.__init__ with `1 - linspace()`
         # So no need for reverse=True here
-        eval_sampler = transport_sampler.sample_ode(**sampler_params)
+        eval_sampler = transport_sampler.sample_ode(
+            **sampler_params, blend_fn=geofix_blend_hook)
     elif sampler_mode == "SDE":
+        if geofix_blend_hook is not None:
+            raise NotImplementedError(
+                "geofix.blend_train with sampler_mode=SDE: `sample_sde` has no "
+                "`blend_fn` hook, so validation would sample an unblended "
+                "trajectory for a blend-trained model. Validate this arm under ODE "
+                "or score it offline with geofix_infer.py --blend-mask.")
         eval_sampler = transport_sampler.sample_sde(**sampler_params)
     # elif sampler_mode == "ODE_MULTI":
     #     eval_sampler = transport_sampler.sample_ode_multiview(**sampler_params)
@@ -1327,7 +1520,7 @@ def main(args):
                         "Only the GeoFix loader supplies it; check dataset.name=geofix.")
                 artifact_images = image      # the render, -> latents_cond target slots
                 image = batch['gt_clean']    # the clean frame, -> flow target
-            if not (geofix_cond_artifact or geofix_bridge):
+            if not (geofix_cond_artifact or geofix_bridge or geofix_blend_train):
                 # Nothing consumes the render: no slot-1 fill, no bridge x0. Keep it
                 # out of prepare_data so the encode is not paid for and the arm is
                 # provably render-free.
@@ -1337,13 +1530,41 @@ def main(args):
             # on, so it is bound separately -- the 2x2 of {input, start-noise} only
             # exists if those two are independently controllable.
             geofix_mask_tokens = None
-            if geofix_mask_in_camera or geofix_bridge_mask_noise:
+            if (geofix_mask_in_camera or geofix_bridge_mask_noise or geofix_blend_train
+                    or geofix_loss_keep_weight != 0.0):
                 if 'mask' not in batch:
                     raise ValueError(
-                        "geofix.mask_in_camera / geofix.bridge_mask_noise is on but "
-                        "the batch has no 'mask'. Only the GeoFix loader supplies "
-                        "it; check dataset.name=geofix.")
+                        "geofix.mask_in_camera / bridge_mask_noise / blend_train is "
+                        "on but the batch has no 'mask'. Only the GeoFix loader "
+                        "supplies it; check dataset.name=geofix.")
                 geofix_mask_tokens = batch['mask']
+                # ------------------------------------------------------------
+                # THE REFERENCE SLOTS MUST BE ZERO. Every consumer downstream
+                # slices `[:, cond_num:]` and is safe by construction -- slot 2
+                # writes `random_masks[:, cond_views:]`, the loss diagnostic
+                # takes `m[:, cond_num:]`, the training blend composites
+                # `xt_5d[:, cond_num:]` -- with ONE exception:
+                # `bridge_mask_noise` computes `sigma = tau * m` over all B*V
+                # views, so a nonzero reference plane would inject start noise
+                # into views that are supposed to be clean conditioning, and the
+                # arm would quietly stop being the control it is named for.
+                #
+                # It holds today only because `GeoFixPairs` emits literal zeros
+                # there, which is a property of the loader and not of this file.
+                # Inference already asserts it (`geofix_infer.assert_ref_slots_zero`);
+                # training asserted nothing until 2026-08-27, so the invariant
+                # was enforced on exactly the half of the pipeline that could
+                # afford to lose it. Message mirrors the inference one on
+                # purpose: two lookalike checks with different wording drift.
+                # ------------------------------------------------------------
+                if geofix_mask_tokens[:, :batch_cond_num].abs().max() > 0:
+                    raise ValueError(
+                        "reference slots [0, cond_num) carry a nonzero mask; "
+                        "GeoFixPairs emits zeros there and bridge_mask_noise's "
+                        "sigma = tau * M_edit runs over ALL views, so a nonzero "
+                        "reference plane would noise the clean conditioning "
+                        f"views. cond_num={int(batch_cond_num)}, max="
+                        f"{float(geofix_mask_tokens[:, :batch_cond_num].abs().max())}.")
             if geofix_mask_in_camera:
                 geofix_mask = geofix_mask_tokens
 
@@ -1384,9 +1605,10 @@ def main(args):
                     random_cond_num=batch_cond_num, return_cls=True,
                     camera_mode=camera_mode, return_scale=use_prope,
                     artifact_images=artifact_images, geofix_mask=geofix_mask,
-                    cond_artifact=geofix_cond_artifact, return_artifact=geofix_bridge
+                    cond_artifact=geofix_cond_artifact,
+                    return_artifact=(geofix_bridge or geofix_blend_train)
                 )
-                if geofix_bridge:
+                if geofix_bridge or geofix_blend_train:
                     x1_cond, x1_all, camera_embedding, geofix_latents_art = _prep
                 else:
                     x1_cond, x1_all, camera_embedding = _prep
@@ -1397,9 +1619,10 @@ def main(args):
                     random_cond_num=batch_cond_num, return_cls=False,
                     camera_mode=camera_mode, return_scale=use_prope,
                     artifact_images=artifact_images, geofix_mask=geofix_mask,
-                    cond_artifact=geofix_cond_artifact, return_artifact=geofix_bridge
+                    cond_artifact=geofix_cond_artifact,
+                    return_artifact=(geofix_bridge or geofix_blend_train)
                 )
-                if geofix_bridge:
+                if geofix_bridge or geofix_blend_train:
                     x1_cond, x1_all, camera_embedding, geofix_latents_art = _prep
                 else:
                     x1_cond, x1_all, camera_embedding = _prep
@@ -1446,8 +1669,34 @@ def main(args):
             # added when a mask actually exists, so stock GLD and the
             # `--geofix-no-mask` ablation arm see the identical model_kwargs
             # they saw before and log nothing rather than a misleading 0.0.
-            if geofix_mask is not None:
-                model_kwargs['geofix_mask_tokens'] = geofix_mask
+            #
+            # GATED ON `geofix_mask_tokens`, NOT ON `geofix_mask` (fixed
+            # 2026-08-27). `geofix_mask` is bound only under `mask_in_camera`,
+            # while `geofix_mask_tokens` is bound under ANY of the three routes
+            # that consume a mask. Gating on the former silently switched the
+            # diagnostic off for the `bridge_mask_noise`-only and
+            # `blend_train`-only arms -- precisely the arms where the mask enters
+            # the TRANSPORT rather than the camera embedding, and therefore
+            # precisely the arms whose loss_keep/loss_edit split is the only
+            # evidence the mask did anything at all.
+            if geofix_mask_tokens is not None:
+                model_kwargs['geofix_mask_tokens'] = geofix_mask_tokens
+            # Separate key from the diagnostic one above: `geofix_mask_tokens` is
+            # observability and changes no gradient, while this one rewrites x_t.
+            # Sharing a key would make an arm that only wanted the LOG silently
+            # start blending.
+            if geofix_loss_keep_weight != 0.0:
+                # The gate reads the mask LOSS-SIDE, so it needs the tokens even
+                # in an arm with slot 2 off -- which is exactly the arm that
+                # isolates "gating the supervision" from "handing the network a
+                # mask".
+                model_kwargs['geofix_mask_tokens'] = geofix_mask_tokens
+                model_kwargs['geofix_loss_keep_weight'] = geofix_loss_keep_weight
+            if geofix_blend_train:
+                model_kwargs['geofix_blend_tokens'] = geofix_mask_tokens
+                # Passed explicitly rather than read off x0 inside the transport,
+                # so the blend works under a noise start as well as under a bridge.
+                model_kwargs['geofix_blend_toward'] = geofix_latents_art
 
             
             # Support ProPE (Fail-loud + consistent normalization)
@@ -1561,11 +1810,40 @@ def main(args):
                     # so it is normalised identically to x1 -- re-encoding here
                     # would be the one way to get that wrong.
                     #
-                    # Only the TARGET half matters: training_multiview_losses
-                    # clamps views [0, cond_num) back to clean x1 regardless of x0
-                    # (`xt = th.where(target_mask, xt, x1_5d)`), so the reference
-                    # slots' x0 is discarded. Passing the whole tensor is therefore
-                    # correct AND inert on the reference half.
+                    # THE WHOLE TENSOR IS PASSED, AND THE REFERENCE HALF IS NOT
+                    # INERT. This comment used to claim that
+                    # `training_multiview_losses` "clamps views [0, cond_num)
+                    # back to clean x1 regardless of x0
+                    # (`xt = th.where(target_mask, xt, x1_5d)`)", so the
+                    # reference slots' x0 was discarded. IT DOES NOT, on this
+                    # path. That clamp lives in the `else` branch of
+                    # `transport.training_multiview_losses` -- target-only mode --
+                    # and `is_concat_mode=True` is hardcoded in `model_kwargs`
+                    # below, so the branch that actually runs concatenates
+                    # `[x1_cond | xt]` and never touches `xt` on the reference
+                    # views. Their x_t therefore interpolates from the ARTIFACT
+                    # features like every other view, and `terms['loss']` --
+                    # `mean_flat` over all V views, the tensor that is backwarded
+                    # -- includes them.
+                    #
+                    # Corrected 2026-08-27, and the consequence was MEASURED
+                    # before the comment was rewritten rather than reasoned about:
+                    # reference views contribute 9.7% of the backpropagated loss
+                    # in bridge arms against 11.5% in noise arms. A 1.8-point
+                    # shift in a term that is under an eighth of the total is not
+                    # meaningful gradient dilution, so NO existing result is
+                    # invalidated by this and no arm needs re-running.
+                    #
+                    # DO NOT "FIX" THIS BY ADDING THE CLAMP. Adding it would
+                    # change what every arm trained so far was supervised on, for
+                    # a 1.8-point effect, and would make new numbers
+                    # incomparable with the ones already in RESULTS.md. The
+                    # defect was the comment; the code stays.
+                    #
+                    # `ref_loss` is logged separately (and split out in the
+                    # transport), so if this ever does start to matter it is
+                    # visible in the existing training curve rather than needing
+                    # a new instrument.
                     if geofix_bridge:
                         if geofix_latents_art is None:
                             raise RuntimeError(
@@ -1857,6 +2135,12 @@ def main(args):
                         "scheduler": schedl.state_dict(),
                         "args": vars(args),
                         "train_steps": train_steps,
+                        # F3: the RESOLVED GeoFix conditioning, so a scorer can
+                        # check train/test parity from the checkpoint instead of
+                        # regexing log.txt. Saved at BOTH sites -- a smoke
+                        # checkpoint that lacked it would train the habit of
+                        # falling back to the log.
+                        "geofix": geofix_settings,
                     }
                     os.makedirs(checkpoint_dir, exist_ok=True)
                     torch.save(checkpoint, f"{checkpoint_dir}/{train_steps:07d}.pt")
@@ -1952,6 +2236,15 @@ def main(args):
                         "steps_per_epoch": steps_per_epoch,
                         "config_path": args.config,
                         "training_cfg": training_cfg,
+                        # F3: every knob that changes what the model was
+                        # conditioned on, resolved AFTER the CLI overrides. The
+                        # `training_cfg` above is the `training:` block only, so
+                        # before this the mask flags, the bridge and the
+                        # dataset's mask_types/pooling/gamma existed nowhere but
+                        # the run banner -- and the train/test gate could only
+                        # check `bridge_x0`, which is how this defect class
+                        # recurred four times.
+                        "geofix": geofix_settings,
                         "cli_overrides": {
                             "data_path": args.data_path,
                             "results_dir": args.results_dir,
@@ -1959,6 +2252,24 @@ def main(args):
                             "precision": args.precision,
                             "global_seed": global_seed,
                         },
+                        # ADDITIVE, 2026-08-27. `config_path` + `training_cfg`
+                        # record the run's shape but NOT how the mask reaches the
+                        # model: the `geofix:` block is not part of `training:`,
+                        # and the `--geofix-*` overrides are not in
+                        # `cli_overrides` either. So a checkpoint could be loaded,
+                        # sampled with the wrong x0, and produce 776 complete
+                        # views and a plausible number -- the failure
+                        # `arm_train_test_gate` documents four occurrences of.
+                        # Reading the intent off `log.txt` was the workaround; it
+                        # breaks the moment a run directory is moved. This is the
+                        # record that travels WITH the weights.
+                        #
+                        # Already-resolved (config + CLI collapsed), so a reader
+                        # never has to re-run the resolution to know what trained.
+                        # Nothing existing is changed or removed, so every loader
+                        # of an older checkpoint is unaffected and every loader of
+                        # a newer one that does not know the key ignores it.
+                        "geofix": dict(geofix_settings),
                     }
                     checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
                     torch.save(checkpoint, checkpoint_path)
@@ -2029,6 +2340,24 @@ def main(args):
                     # RENDER rather than the clean frame. Finite, plotted, wrong.
                     geofix_cond_artifact=geofix_cond_artifact,
                     geofix_mask_in_camera=geofix_mask_in_camera,
+                    # ADDED 2026-08-27. The two above were the only ones passed,
+                    # and the trainer supports five more routes. The two measured
+                    # consequences: a bridge arm was validated FROM A NOISE START
+                    # (val/loss_ref 0.0786 -> 0.5016 against a noise arm's 0.0786
+                    # -> 0.0674, a curve that reads as divergence and means "wrong
+                    # x0"), and the NVS control -- `clean_target` alone, with
+                    # cond_artifact off -- had its PSNR taken against the ARTIFACT
+                    # RENDER, because validation gated the gt_clean swap on
+                    # `cond_artifact` where the trainer gates it on `clean_target`.
+                    #
+                    # `tests/test_val_geofix_reflection.py` now asserts by
+                    # reflection that this list cannot fall behind again.
+                    geofix_clean_target=geofix_clean_target,
+                    geofix_bridge_x0=geofix_bridge_x0,
+                    geofix_bridge_noise_tau=geofix_bridge_noise_tau,
+                    geofix_bridge_mask_noise=geofix_bridge_mask_noise,
+                    geofix_blend_train=geofix_blend_train,
+                    geofix_blend_hook=geofix_blend_hook,
                 )
                 # remove images from printed log
                 log_copy = {k: v for k, v in val_stats.items() if k != "val/images"}
@@ -2112,6 +2441,12 @@ if __name__ == "__main__":
                              "to give all four cells of the two-slot ablation off "
                              "ONE config file.")
 
+    parser.add_argument("--geofix-manifest", default=None,
+                        help="Override dataset.manifest for the TRAINING loader "
+                             "only, leaving val_manifest and every other config "
+                             "value untouched. Exists for the scene-count scaling "
+                             "curve, where the manifest is the only thing that may "
+                             "differ between arms.")
     parser.add_argument("--geofix-clean-target", action="store_true",
                         help="Supervise the flow toward the CLEAN photograph even "
                              "with both conditioning slots off. Without it, an arm "
@@ -2128,6 +2463,17 @@ if __name__ == "__main__":
                              "features of the 3DGS render instead of at noise, so "
                              "the model learns F_artifact -> F_clean. Overrides "
                              "geofix.bridge_x0.")
+    parser.add_argument("--geofix-blend-train", action="store_true",
+                        help="LATENT BLENDING AT TRAINING TIME: composite x_t "
+                             "toward the artifact features by (1 - M_edit), which "
+                             "under a bridge is exactly the per-token time "
+                             "t_i = 1 - M_i (1 - t). Requires --geofix-bridge-x0 "
+                             "artifact. The loss target is NOT modulated: clean is "
+                             "the truth everywhere, including where the mask says "
+                             "preserve.")
+    parser.add_argument("--geofix-no-blend-train", action="store_true",
+                        help="Force geofix.blend_train off so the control runs off "
+                             "the SAME config file as the blended arm.")
     parser.add_argument("--geofix-bridge-mask-noise", action="store_true",
                         help="THE MASK-MODULATED BRIDGE: scale the bridge start "
                              "noise per token by M_edit, so the flow starts "
@@ -2139,6 +2485,12 @@ if __name__ == "__main__":
                         help="Force geofix.bridge_mask_noise off so the unmodulated "
                              "bridge control runs off the SAME config file as the "
                              "mask-modulated arm.")
+    parser.add_argument("--geofix-loss-keep-weight", type=float, default=None,
+                        help="PHASE 3a, the mask-gated loss: weight the per-token "
+                             "flow loss by 1 + lambda*(1-M_edit) on target views, "
+                             "renormalised to mean 1 so lambda is not a learning "
+                             "rate in disguise. Upweights the PRESERVE region. "
+                             "0 = inert. Overrides geofix.loss_keep_weight.")
     parser.add_argument("--geofix-no-bridge-x0", action="store_true",
                         help="Force geofix.bridge_x0 off, so the noise-x0 control "
                              "runs off the SAME config file as the bridge arm.")

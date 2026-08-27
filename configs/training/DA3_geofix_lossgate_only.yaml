@@ -1,3 +1,12 @@
+# GeoFix -- MASK-GATED LOSS (GenRec Phase 3a).  lambda = 1.0
+#
+# THIS ARM: gate ONLY: slot 2 off, so the mask reaches the LOSS and never the network.
+#
+# The set is lossgate_l1 / lossgate_l3 / lossgate_only, read against the existing
+# mask_on arm (same config, loss_keep_weight 0). `lossgate_only` is the one that
+# separates "gating the supervision" from "handing the network a mask" -- the
+# distinction the whole idea rests on.
+#
 # GeoFix session 8 -- finetune the released level-1 checkpoint to repair 3DGS
 # artifact renders, conditioned on our uncertainty masks.
 #
@@ -87,7 +96,7 @@ geofix:
   # mask in the project that enters with NO sign flip -- hard rule 7 satisfied by
   # construction rather than by a correction. CFG preserves it: the uncond branch
   # zeroes camera channels 1: and keeps 0.
-  mask_in_camera: true
+  mask_in_camera: false
 
   # ------------------------------------------------------------------------
   # What the flow is supervised TOWARD. `gt_inp` from the GeoFix loader is the
@@ -139,6 +148,15 @@ geofix:
   # The loss target is NOT modulated: clean is the truth everywhere, including
   # where the mask says preserve.
   blend_train: false
+
+  # PHASE 3a -- THE MASK-GATED LOSS. w = 1 + lambda*(1 - M_edit) on target views,
+  # renormalised to mean 1 so lambda changes the loss SHAPE and not its scale.
+  # Upweights the PRESERVE region: GenRec's direction (supervise precisely where
+  # the answer is determined) and the one this project's own loss-split
+  # diagnostic argues for ("weighting by M_edit would suppress exactly the
+  # behaviour we lack" -- arm A has no leave-this-alone mode).
+  # 0.0 is bit-for-bit the unweighted loss.
+  loss_keep_weight: 1.0
 
 transport:
   params:

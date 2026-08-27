@@ -262,6 +262,16 @@ class Transport:
         # token-grid mask rides in model_kwargs so the loss can see it; it is
         # dropped before the model call, exactly like `total_view`.
         geofix_mask_tokens = model_kwargs.get("geofix_mask_tokens", None)
+        # GeoFix LATENT BLENDING AT TRAINING TIME. See the block after plan().
+        geofix_blend_tokens = model_kwargs.get("geofix_blend_tokens", None)
+        # WHAT the blend composites toward -- always the ARTIFACT latents, passed
+        # explicitly rather than read off x0. Under a bridge they are the same
+        # tensor, and taking it from x0 made the operation look like it REQUIRED a
+        # bridge when only the time-reparameterisation identity does.
+        geofix_blend_toward = model_kwargs.get("geofix_blend_toward", None)
+        # GeoFix PHASE 3a -- THE MASK-GATED LOSS. Unlike `geofix_mask_tokens`
+        # above, this one DOES touch gradients. See the block after `terms['loss']`.
+        geofix_loss_keep_weight = float(model_kwargs.get("geofix_loss_keep_weight", 0.0))
         
         # ------------------------------------------------------------
         # 1. Sample init noise x0 and time t
@@ -299,6 +309,87 @@ class Transport:
         t, xt, ut = self.path_sampler.plan(t, x0, x1_target)
 
         # ------------------------------------------------------------
+        # GeoFix: LATENT BLENDING, APPLIED AT TRAINING TIME.
+        #
+        # Session 6.5's blend composites, at every solver step,
+        #
+        #     x_t  <-  M * x_t + (1 - M) * F_artifact
+        #
+        # and there is no solver loop here -- one t, one forward pass. But under a
+        # BRIDGE (x0 = F_artifact) that composite has an exact single-shot form.
+        # For the linear path, alpha_t = 1 - t and sigma_t = t, so
+        #
+        #     x_t = (1 - t) x1 + t x0
+        #
+        # and substituting into the composite,
+        #
+        #     M[(1-t) x1 + t x0] + (1-M) x0
+        #       = M(1-t) x1 + [Mt + 1 - M] x0
+        #       = (1 - t_i) x1 + t_i x0        with   t_i = 1 - M_i (1 - t)
+        #
+        # i.e. THE BLEND IS EXACTLY A PER-TOKEN TIME REPARAMETERISATION of the
+        # bridge. M = 1 ("repair here") leaves t_i = t and the token transports
+        # normally; M = 0 ("preserve here") gives t_i = 1 and the token sits at
+        # F_artifact. Nothing is approximated -- this is an identity, and it only
+        # holds because x0 is the artifact. With a noise x0 the same algebra gives
+        # a spatially varying SNR, which is a different and far less interesting
+        # object, so this refuses to run outside a bridge (checked at the caller).
+        #
+        # `ut` IS DELIBERATELY NOT MODULATED. For the linear path ut = x0 - x1,
+        # independent of t, so a per-token time changes the input and not the
+        # target -- which is the correct supervision: clean is the truth
+        # everywhere, including where the mask says "preserve". Scaling ut by M
+        # would supervise preserved tokens to STAY, i.e. teach the model to
+        # reproduce 3DGS artifacts wherever the mask is 0. That is the same
+        # M = 0 supervision trap CLAUDE.md records for zero-filled masks, and it
+        # is why the blend is applied to x_t alone.
+        #
+        # TARGET VIEWS ONLY. The loader zeroes the mask on reference slots
+        # (`assert_ref_slots_zero`), and t_i = 1 - 0 * (1-t) = 1 would freeze
+        # every reference view at its artifact features. At inference the blend
+        # forces M_edit = 1 on references for the same reason -- there, identity;
+        # here, exclusion.
+        #
+        # AND IT DOES NOT NEED A BRIDGE. The identity above does -- with x0 ~ N(0, I)
+        # the algebra no longer collapses to a per-token time. But the OPERATION is
+        # well defined either way, because what it composites toward is the artifact
+        # latents, not x0: under a noise start this is literally session 6.5's blend,
+        # moved from sampling time into the training loop. That is the direct test of
+        # why `geofix_blend_s29500` lost 0.457 dB -- the model met the composite for
+        # the first time at inference. Both rows of that 2x2 are therefore real, and
+        # only the `t_i` reading is bridge-specific.
+        # ------------------------------------------------------------
+        if geofix_blend_tokens is not None:
+            if geofix_blend_toward is None:
+                raise ValueError(
+                    "geofix_blend_tokens was given without geofix_blend_toward. "
+                    "Defaulting the target to x0 would silently make this a bridge-"
+                    "only feature and, under a noise x0, composite toward NOISE "
+                    "wherever the mask says 'preserve' -- the exact opposite of what "
+                    "the mask means.")
+            m = geofix_blend_tokens
+            expected = (B, total_view, 1) + tuple(xt.shape[-2:])
+            if tuple(m.shape) != expected:
+                raise ValueError(
+                    "geofix_blend_tokens shape mismatch: expected (B, V, 1, h, w) = "
+                    f"{expected} to match xt {tuple(xt.shape)} on the token grid, got "
+                    f"{tuple(m.shape)}. The mask must already be MAX-pooled onto the "
+                    "latent token grid (hard rule 6); it is never resized here.")
+            m = m.to(device=xt.device, dtype=xt.dtype)
+            toward = geofix_blend_toward.to(device=xt.device, dtype=xt.dtype)
+            if toward.shape != xt.shape:
+                raise ValueError(
+                    f"geofix_blend_toward {tuple(toward.shape)} != xt "
+                    f"{tuple(xt.shape)}; the composite mixes two tensors that must "
+                    "share a shape AND a normalisation.")
+            xt_5d = rearrange(xt, "(b v) c h w -> b v c h w", v=total_view)
+            tw_5d = rearrange(toward, "(b v) c h w -> b v c h w", v=total_view)
+            m_tgt = m[:, cond_num:]
+            xt_5d[:, cond_num:] = (m_tgt * xt_5d[:, cond_num:]
+                                   + (1.0 - m_tgt) * tw_5d[:, cond_num:])
+            xt = rearrange(xt_5d, "b v c h w -> (b v) c h w")
+
+        # ------------------------------------------------------------
         # 3. Handle Conditional Views
         #    - Concat Mode: Build [cond(ref+zeropad) | noisy] input
         #    - Target-Only Mode: Clamp cond views to x1 (clean GT)
@@ -328,7 +419,8 @@ class Transport:
         
         # Minkyung debugging: Remove duplicate 'total_view' from model_kwargs
         # 'geofix_mask_tokens' is loss-side only and must never reach the model.
-        _drop_kwargs = ('total_view', 'geofix_mask_tokens')
+        _drop_kwargs = ('total_view', 'geofix_mask_tokens', 'geofix_blend_tokens',
+                        'geofix_blend_toward', 'geofix_loss_keep_weight')
         if any(k in model_kwargs for k in _drop_kwargs):
             model_kwargs = {k: v for k, v in model_kwargs.items() if k not in _drop_kwargs}
         
@@ -358,6 +450,81 @@ class Transport:
             ref_diff_sq = diff_sq[:, :cond_num]
             tgt_diff_sq = diff_sq[:, cond_num:]
             
+            # ----------------------------------------------------------------
+            # GeoFix PHASE 3a: THE MASK-GATED LOSS (GenRec, arXiv 2608.17832).
+            #
+            # GenRec's contribution is not its mask; it is that the mask gates
+            # the SUPERVISION. Their Table 6 rows (b) vs (d) share architecture,
+            # parameter count and training procedure and differ only in whether
+            # supervision is gated: removing the gate costs +7.34 FID, and their
+            # stated failure mode is "over-smoothed or mean-collapsed content in
+            # disocclusions" -- our exact symptom (unseen hf_ratio 0.545 -> 0.516,
+            # below the render's own 0.550).
+            #
+            # WHY THIS IS NOT ANOTHER REPEAT OF A CLOSED LINE. Every mask
+            # mechanism this project has run gates one of two things: which
+            # endpoint to keep (the 6.5 blend, the pixel composite) or how much
+            # refinement to apply (`bridge_mask_noise`). All are closed with
+            # measured negatives. `docs/MORNING_2026-08-24.md` states the
+            # remaining question as "it would have to gate something OTHER than
+            # endpoint choice or refinement strength, and nobody has proposed
+            # one." Gating the supervision is that thing, and the loss split
+            # directly below has been sitting here as a read-only diagnostic --
+            # "observability only, nothing here touches a gradient" -- the whole
+            # time.
+            #
+            # THE DIRECTION, and it is the opposite of the obvious one. Two
+            # independent arguments agree:
+            #   * GenRec: where the answer is DETERMINED, supervise it precisely;
+            #     where it is not, let the prior generate. Under `edit1`, M = 0
+            #     is "clean, preserve" -- the determined region.
+            #   * This file's own diagnostic comment: "Weighting the gradient by
+            #     M_edit would DOWNWEIGHT the preserve regions, i.e. suppress
+            #     exactly the behaviour we lack" -- arm A has no "leave this
+            #     alone" mode (+1.96 dB on damaged scenes, -3.09 dB on clean).
+            # So the weight rises where the mask says PRESERVE:
+            #
+            #     w = 1 + lambda * (1 - M)      lambda = geofix_loss_keep_weight
+            #
+            # lambda = 0 is EXACTLY the unweighted loss, bit-for-bit, so an
+            # unset run is inert by construction rather than by inspection.
+            #
+            # THE TARGET IS NOT MODULATED, only the weight. That is what makes
+            # this different from the trap `CLAUDE.md` records for zero-filled
+            # masks: clean remains the truth everywhere, including where the mask
+            # says preserve. Scaling `ut` instead would teach the model to
+            # reproduce 3DGS artifacts wherever M = 0.
+            #
+            # TARGET VIEWS ONLY. Reference views carry a zero mask, and 1 - 0 = 1
+            # would silently upweight every reference token by (1 + lambda) --
+            # inflating the half of the loss that is nearly trivial anyway
+            # (measured: refs are 9.7-11.5% of the backpropagated loss).
+            # ----------------------------------------------------------------
+            if geofix_loss_keep_weight != 0.0:
+                if geofix_mask_tokens is None:
+                    raise ValueError(
+                        "geofix_loss_keep_weight is set but no mask reached the "
+                        "transport. The gate would silently become a uniform "
+                        "rescale of the loss, which is a learning-rate change "
+                        "wearing a mask arm's name.")
+                mw = geofix_mask_tokens.to(device=diff_sq.device, dtype=diff_sq.dtype)
+                expected = (B, total_view, 1) + tuple(diff_sq.shape[-2:])
+                if tuple(mw.shape) != expected:
+                    raise ValueError(
+                        f"geofix_loss_keep_weight mask shape {tuple(mw.shape)} != "
+                        f"{expected}; it must already be on the token grid.")
+                w = th.ones_like(diff_sq[:, :, :1])
+                w[:, cond_num:] = 1.0 + geofix_loss_keep_weight * (1.0 - mw[:, cond_num:])
+                # Renormalised so lambda changes the loss SHAPE and not its scale
+                # -- otherwise every lambda is confounded with a learning rate,
+                # and the arms would not be an ablation.
+                w = w / w.mean()
+                diff_sq = diff_sq * w
+                tgt_diff_sq = diff_sq[:, cond_num:]
+                ref_diff_sq = diff_sq[:, :cond_num]
+                terms['loss_gate_lambda'] = th.as_tensor(
+                    geofix_loss_keep_weight, device=diff_sq.device)
+
             terms['loss'] = mean_flat(rearrange(diff_sq, "b v c h w -> (b v) c h w"))
             terms['ref_loss'] = mean_flat(rearrange(ref_diff_sq, "b v c h w -> (b v) c h w"))
             terms['tgt_loss'] = mean_flat(rearrange(tgt_diff_sq, "b v c h w -> (b v) c h w"))
