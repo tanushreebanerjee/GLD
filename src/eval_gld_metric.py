@@ -216,12 +216,91 @@ def get_cascade_features(
     noise_tau=0.0,
     prope_image_size=None,
     eval_mode='cascade',
+    # =========================================================================
+    # GeoFix: the SAME TWO CONDITIONING SLOTS, at LEVEL 0.
+    #
+    # Everything below defaults to OFF, and OFF is byte-identical to the code
+    # that shipped before this block existed. `geofix_mask=None` skips
+    # `grade_camera_mask` entirely; `geofix_artifact_images=None` skips both the
+    # extra encode and `fill_cond_artifact`; `geofix_gamma == 1.0` is an
+    # explicit no-op BRANCH rather than a `pow(1.0)`, because `x ** 1.0` is not
+    # guaranteed bit-identical to `x` for every float and this function feeds
+    # numbers that are compared bit-exactly. So every existing caller, and every
+    # RESULTS.md number that came through this function, is unaffected.
+    #
+    # ## Why level 0 at all, given it buys no resolution
+    #
+    # GLD's "levels" are DA3 BLOCK DEPTHS, not resolutions: level 0 is block 5,
+    # level 1 is block 7, and BOTH are (B*V, 1536, 36, 36). Moving the mask here
+    # buys no spatial resolution whatsoever -- only semantic depth. (The header
+    # comment of DA3_level1.yaml claiming 518 / 37x37 is stale; its own params
+    # say 504.)
+    #
+    # ## This is NOT the "do not blend at both levels" rule
+    #
+    # CLAUDE.md's rule -- +0.100 dB for `oracle_bin` and -0.268 dB for
+    # `oracle_abs` when compositing at level 0 on top of level 1 -- is about
+    # BLENDING: mixing latents into x_t during sampling. It is a rule against
+    # applying the SAME composite twice, when the cascade already propagates the
+    # first one. CONDITIONING is a different operation: the network READS the
+    # slot instead of being averaged with it, nothing is applied twice, and
+    # docs/ARCH_NOTES.md records the opposite prediction as an intended
+    # contribution. **No level-0 CONDITIONING result exists in RESULTS.md, for
+    # either sign.** Do not cite the blending numbers as a forecast for these.
+    #
+    # ## >>> LOAD-BEARING CAVEAT -- READ BEFORE SCORING ANYTHING WITH THESE <<<
+    #
+    # `third_party/gld/checkpoints/da3_cascade.pt` HAS NEVER SEEN EITHER INPUT.
+    # It was trained with `cond_channel[:, cond_num:]` all zeros and with camera
+    # channel 0 a strict {0, 1} that was also spatially CONSTANT WITHIN EACH
+    # VIEW. Switching these arguments on against that checkpoint does not add a
+    # conditioning signal; it hands a converged model an off-distribution input
+    # at inference, where nothing can adapt.
+    #
+    # How far off-distribution: the level-1 route through the identical two
+    # slots produced gradient norms of 269.5 (mean over steps 0-9, 10/10 above
+    # the clip threshold) and took ~70 steps of LR warmup to fall below 10 --
+    # the full table is in src/utils/geofix_slots.py. That is the cost measured
+    # on a network that WAS allowed to adapt.
+    #
+    # So: **these arguments are for AFTER a cascade finetune**, using
+    # gld-session7/configs/training/DA3_geofix_cascade.yaml. Scoring the
+    # released cascade with them on and reporting the null would not be a
+    # negative result about level-0 conditioning; it would be a measurement of
+    # the distribution shift wearing a conditioning result's name.
+    # =========================================================================
+    geofix_artifact_images=None,   # (B, V, 3, H, W) 3DGS renders -> L0 slot 1
+    geofix_mask=None,              # (B, V, 1, g, g) M_edit on the token grid
+    geofix_gamma=1.0,              # PER-LEVEL contrast exponent; see below
 ):
     """
     Feature Flow: L1 → L0 via diffusion sampling.
 
     Args:
         source_features: [latent_norm] L1 features (BV, C, h, w)
+
+        geofix_artifact_images: (B, V, 3, H, W) 3DGS renders, in [0, 1] like
+            `batch['image']`. Fills `cond_channel[:, cond_num:]`, which stock
+            GLD leaves as ZEROS -- the exact level-0 analogue of the level-1
+            slot `fill_cond_artifact` fills in `get_denoised_features`. They are
+            encoded HERE, inside the target-level normalisation window, and that
+            placement is the whole point: level 0 and level 1 have DIFFERENT
+            channel statistics, and encoding the render under level-1 stats
+            would put the conditioning in a different space from the reference
+            features sitting beside it in the same tensor. That failure does not
+            raise; it decodes to something plausible, which is the class of bug
+            this project has already paid for twice (the double-normalisation
+            mush at 13.25 dB, and the released-vs-our-leg statistics gap).
+
+        geofix_mask: (B, V, 1, g, g) `edit1` mask on the token grid, 1 = "repair
+            here". Replaces the constant 1.0 that target views carry in camera
+            channel 0. NO SIGN FLIP -- see utils/geofix_slots.py, hard rule 7 is
+            satisfied by construction here and a defensive flip would be the bug.
+
+        geofix_gamma: exponent applied to `geofix_mask` before it enters the
+            camera channel, so level 0 can run at a different mask contrast from
+            level 1. See the block above the argument list.
+
     Returns:
         [latent_norm] L0 features (BV, C, h, w)
     """
@@ -267,6 +346,27 @@ def get_cascade_features(
     
     with torch.no_grad():
         latents_ref_l0 = rae.encode(images_norm[:, :cond_num], level=0)
+        # GeoFix slot 1 at LEVEL 0. Encoded INSIDE this window, deliberately:
+        # `rae.latent_mean` / `latent_var` are level-0's for exactly these few
+        # lines, and `_normalize` reads them off the module. Hoisting this encode
+        # out of the window -- or doing it at the call site, where the RAE is
+        # still on level-1 statistics -- would normalise the render's features
+        # with the wrong per-channel mean and variance and then place them in the
+        # same tensor as `latents_ref_l0`, which was normalised correctly. Two
+        # halves of one conditioning channel living in two different spaces is
+        # not a crash, it is a quietly wrong number.
+        latents_art_l0 = None
+        if geofix_artifact_images is not None:
+            if geofix_artifact_images.shape != images.shape:
+                raise ValueError(
+                    f"artifact images {tuple(geofix_artifact_images.shape)} must "
+                    f"match images {tuple(images.shape)}.")
+            # Same ImageNet normalisation the stock path applies to `images`
+            # above; `batch['image']` and the render both arrive in [0, 1].
+            art_norm = ((geofix_artifact_images.to(device)
+                         - rae.encoder_mean[None].to(device))
+                        / rae.encoder_std[None].to(device))
+            latents_art_l0 = rae.encode(art_norm, level=0)
     
     rae.latent_mean = original_mean
     rae.latent_var = original_var
@@ -300,6 +400,44 @@ def get_cascade_features(
     
     random_masks = torch.ones((B, V, 1, H, W), device=device, dtype=source_features.dtype)
     random_masks[:, :cond_num] = 0
+    # GeoFix slot 2 at LEVEL 0. Byte-for-byte the same construction the level-1
+    # path uses (utils/da3_validation_metric.py, `get_denoised_features`), which
+    # is why it can reuse `grade_camera_mask` unchanged instead of growing a
+    # second copy of the masking logic here. Three code paths already build this
+    # conditioning and they have to agree exactly; a fourth private
+    # implementation is how they stop agreeing.
+    if geofix_mask is not None:
+        from utils.geofix_slots import grade_camera_mask
+        m = geofix_mask.to(device=device, dtype=random_masks.dtype)
+        if geofix_gamma != 1.0:
+            # ----------------------------------------------------------------
+            # PER-LEVEL GAMMA -- a contrast exponent on M_edit applied HERE and
+            # only here, so level 0 can run at a different mask contrast from
+            # level 1. Higher gamma means a SMALLER effective mask area: the
+            # loader's own measurement on this data is 1.0 -> 0.632, 1.5 ->
+            # 0.523, 2.0 -> 0.438 mean area (DA3_geofix_level1.yaml). `clamp`
+            # mirrors `video/geofix_pairs.py`'s `m.clamp(min=0).pow(gamma)` so
+            # the two sites cannot disagree on a negative input.
+            #
+            # THIS IS OUR IDEA, NOT A TRANSPLANT -- do NOT cite FreeFix as
+            # precedent for it, which is easy to do by accident because FreeFix
+            # does have a gamma_c schedule. Theirs is PER-TIMESTEP, not
+            # per-level: `c_exp_index: [0.001, 0.01, 0.1]` selected in three
+            # piecewise-constant stages by `c_scheduler: [0.3, 0.9, 1.0]`
+            # (third_party/freefix/exp_cfg/base.yaml; the selection loop is
+            # third_party/freefix/ours/pipelines/flux_pipeline.py ~1030-1034),
+            # and their gamma_c enters PRE-RASTERISATION, per Gaussian. FreeFix
+            # has one latent resolution and no pyramid at all, so a per-LEVEL
+            # gamma is not something it could have had. The paper must say so.
+            #
+            # What gamma can and cannot do, so nobody over-reads a sweep of it:
+            # it is MONOTONE, so it cannot reorder tokens and a trained network
+            # can undo it. It is an INITIALISATION for a finetune, not a tuned
+            # constant, and CLAUDE.md is explicit that it must not be re-tuned
+            # on blend PSNR.
+            # ----------------------------------------------------------------
+            m = m.clamp(min=0).pow(geofix_gamma)
+        grade_camera_mask(random_masks, m, cond_num, (H, W))
     random_masks = random_masks.reshape(B * V, 1, H, W)
     camera_embedding = torch.cat([random_masks, camera_embedding], dim=1)
     
@@ -322,6 +460,20 @@ def get_cascade_features(
     latents_ref_5d = latents_ref_l0.reshape(B, cond_num, C_lat, h_lat, w_lat)
     cond_channel = torch.zeros(B, V, C_lat, h_lat, w_lat, device=device, dtype=source_features.dtype)
     cond_channel[:, :cond_num] = latents_ref_5d
+    # GeoFix slot 1 at LEVEL 0: the target half stops being zeros and carries the
+    # render's level-0 features. Reference slots [0, cond_num) are left exactly as
+    # set above -- they hold the CLEAN photographs, and `fill_cond_artifact`
+    # refuses to touch them for that reason.
+    #
+    # Note what this does NOT have an inert setting for: unlike the mask, whose
+    # all-ones value reproduces the constant the checkpoint has always seen,
+    # there is no value of the render that makes filling these zeros a no-op.
+    # Slot 1 is inert only when it is OFF, which is why the inertness gate
+    # (scripts/cascade_mask_inertness_gate.py) covers the mask path and states
+    # plainly that it does not cover this one.
+    if latents_art_l0 is not None:
+        from utils.geofix_slots import fill_cond_artifact
+        fill_cond_artifact(cond_channel, latents_art_l0, cond_num)
     
     # [condition | xT]
     sample_input = torch.cat([cond_channel, sample_xT], dim=2)

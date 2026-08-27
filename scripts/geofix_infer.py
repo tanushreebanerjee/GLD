@@ -413,6 +413,59 @@ def main() -> int:
                     help="Grade camera channel 0 by M_edit. Trains, but only after "
                          "~70 steps of LR warmup absorb the distribution shift -- see "
                          "src/utils/geofix_slots.py before reading an early curve.")
+    # ------------------------------------------------------------------------
+    # LEVEL 0. The same two slots again, on the L1->L0 cascade.
+    #
+    # WHY TWO BOOLEANS AND NOT `--mask-level {1,0,both}`. An enum would couple
+    # the two slots to each other and to the level: it can express "mask at
+    # both" but not "render at level 1, mask at level 0", and the ablation
+    # ladder this project actually runs is the CROSS PRODUCT of {slot 1, slot 2}
+    # x {level 1, level 0}. Session 6.5 had to separate slot 1 from slot 2 to
+    # find that slot 2 alone "says preserve while supplying nothing to
+    # preserve"; collapsing the level axis into an enum would re-create exactly
+    # that confound one level down. Four independent booleans, four independent
+    # arms, and each one names precisely what it turns on.
+    #
+    # Both default OFF, so every existing command line is byte-identical.
+    #
+    # NOTHING HAS BEEN FINETUNED FOR THESE YET. `da3_cascade.pt` never saw a
+    # filled condition slot or a graded camera channel -- see the long block
+    # above `geofix_artifact_images` in src/eval_gld_metric.py. Run these
+    # against a cascade finetuned with
+    # gld-session7/configs/training/DA3_geofix_cascade.yaml; against the
+    # released cascade they measure a distribution shift, not a conditioning
+    # signal, and a null from that run must not be written down as a null about
+    # level-0 conditioning (hard rule 8).
+    # ------------------------------------------------------------------------
+    ap.add_argument("--cond-artifact-l0", action="store_true",
+                    help="LEVEL 0 slot 1: fill the cascade's cond_channel[:, "
+                         "cond_num:] -- zeros in stock GLD -- with the render's "
+                         "LEVEL-0 features. Independent of --cond-artifact, "
+                         "which does the same thing at level 1. Requires a "
+                         "cascade finetuned for it; the released da3_cascade.pt "
+                         "has never seen a non-zero value there.")
+    ap.add_argument("--mask-in-camera-l0", action="store_true",
+                    help="LEVEL 0 slot 2: grade the cascade's camera channel 0 "
+                         "by M_edit instead of the constant 1.0 on target "
+                         "views. Independent of --mask-in-camera. Reads the "
+                         "SAME batch['mask'] -- including any --mask-const / "
+                         "--mask-transform control -- so a control arm controls "
+                         "both levels rather than only one.")
+    ap.add_argument("--gamma-level0", type=float, default=None,
+                    help="PER-LEVEL contrast exponent for the level-0 mask. "
+                         "Defaults to --gamma, i.e. the same mask both levels "
+                         "get today, which makes it INERT unless set.\n"
+                         "Higher gamma = smaller effective mask area (measured "
+                         "on this data: 1.0 -> 0.632, 1.5 -> 0.523, 2.0 -> "
+                         "0.438 mean area). Applied as a RESIDUAL exponent, "
+                         "gamma_level0 / gamma, on top of the exponent "
+                         "GeoFixPairs already applied at load time -- exact, "
+                         "because (m**g1)**(g0/g1) == m**g0 for m >= 0, and "
+                         "cheaper than loading the dataset twice.\n"
+                         "NOT a FreeFix transplant. FreeFix's gamma_c schedule "
+                         "is per-TIMESTEP and pre-rasterisation; it has one "
+                         "latent resolution and no pyramid. Per-LEVEL gamma is "
+                         "ours -- do not cite them as precedent.")
     ap.add_argument("--cond-source", default="render",
                     choices=("render", "gt", "zeros", "shuffled"),
                     help="WHAT goes in slot 1, holding everything else fixed. This is "
@@ -491,8 +544,40 @@ def main() -> int:
                          "Read with --mask-const, not instead of it: a constant "
                          "removes structure AND placement, roll removes placement "
                          "alone.")
+    ap.add_argument("--mask-pack", default=None, metavar="NPZ",
+                    help="OVERRIDE the mask with an external pack, one 36x36 "
+                         "`edit1` plane per (split, frame), written by "
+                         "`geofix.blend.containment_gate pack`.\n"
+                         "It exists because the masks this pipeline can consume "
+                         "all come from the export tree's `<frame>.edit1.npz`, "
+                         "and a mask computed AFTER an arm was generated -- the "
+                         "pointwise-optimal selector between that arm and the "
+                         "render -- cannot be written there without corrupting "
+                         "every other arm that reads the same files. So it "
+                         "arrives beside the manifest instead.\n"
+                         "The pack replaces the TARGET-view planes of "
+                         "batch['mask'] and nothing else; reference slots stay "
+                         "zero, exactly as GeoFixPairs emits them. Polarity is "
+                         "checked on load (`edit1`, 1 = take the GENERATION), so "
+                         "it enters --blend-mask with no flip. Every target view "
+                         "of the manifest must be present or the run is refused: "
+                         "a missing plane would silently become an all-generate "
+                         "mask (hard rule 8).\n"
+                         "It REPLACES the manifest mask outright, so --gamma "
+                         "(which GeoFixPairs applies to that mask) does not "
+                         "reach a pack plane -- shape the pack when you build "
+                         "it. Needs --blend-mask or --mask-in-camera to reach "
+                         "the model at all, and refuses to combine with the "
+                         "--mask-const / --mask-transform controls.")
     ap.add_argument("--gamma", type=float, default=1.0,
                     help="Contrast exponent on the pooled mask; must match training.")
+    ap.add_argument("--pooling", default="max",
+                    choices=("max", "mean", "rms", "max_arearef_rms"),
+                    help="How the 504x504 mask plane is reduced to the token grid. "
+                         "MUST match training. 'max' is hard rule 6 and the only "
+                         "mode a deployable mask may use; 'rms' and "
+                         "'max_arearef_rms' are the L2-oracle pair and both read "
+                         "the oracle plane, so neither is deployable.")
     ap.add_argument("--seed", type=int, default=0,
                     help="Fixed across arms so xT is identical and the comparison is paired.")
     ap.add_argument("--limit", type=int, default=None, help="Smoke: first N samples only.")
@@ -531,8 +616,71 @@ def main() -> int:
                          "the same walk removes any chance of a misaligned pairing.")
     args = ap.parse_args()
 
+    # `--gamma-level0` is a residual exponent on the mask, so it does nothing
+    # unless the level-0 mask slot is actually on. Refusing rather than warning:
+    # a run whose name says "gamma 2.0 at level 0" and whose mask never reached
+    # level 0 is a mislabelled arm, which is the failure --mask-const's guards
+    # already exist to prevent.
+    if args.gamma_level0 is not None and not args.mask_in_camera_l0:
+        raise SystemExit(
+            "--gamma-level0 sets the contrast of the LEVEL-0 mask and does "
+            "nothing without --mask-in-camera-l0. Add it, or drop "
+            "--gamma-level0.")
+    gamma_l0 = args.gamma if args.gamma_level0 is None else float(args.gamma_level0)
+    if gamma_l0 == args.gamma:
+        # Exactly 1.0 and taken as an explicit no-op branch downstream, so the
+        # default path never applies a pow at all.
+        gamma_ratio_l0 = 1.0
+    else:
+        if args.gamma <= 0:
+            raise SystemExit(
+                f"--gamma {args.gamma} is not positive, so the residual exponent "
+                f"gamma_level0/gamma is undefined. A per-level gamma needs a "
+                f"positive base gamma to divide out.")
+        if args.mask_const is not None:
+            # `constant_mask` matches area AFTER --gamma, per its own docstring.
+            # Raising the matched constant to a further exponent moves the area
+            # it was matched to, so the "area-matched" control would no longer be
+            # area-matched at level 0 -- a control in name only, which is exactly
+            # what the other guards in this block refuse.
+            raise SystemExit(
+                "--gamma-level0 with --mask-const is not supported: the constant "
+                "mask is area-matched AFTER --gamma, and a second exponent moves "
+                "that area, leaving the level-0 control matched to nothing.")
+        gamma_ratio_l0 = gamma_l0 / args.gamma
+        print(f"[infer] level-0 mask gamma {gamma_l0} (level-1 {args.gamma}); "
+              f"residual exponent {gamma_ratio_l0:.6f}", flush=True)
+
+    mask_pack = mask_pack_meta = None
+    if args.mask_pack is not None:
+        if not (args.blend_mask or args.mask_in_camera or args.mask_in_camera_l0):
+            raise SystemExit(
+                "--mask-pack replaces the mask, and with neither --blend-mask nor "
+                "--mask-in-camera the mask never reaches the model -- the run "
+                "would be plain refinement wearing a mask arm's name.")
+        if args.mask_const is not None or args.mask_transform != "none":
+            # Both rewrite the mask too. Layering them would leave the arm's
+            # name describing one intervention and its inputs carrying two.
+            raise SystemExit(
+                "--mask-pack with --mask-const/--mask-transform is not "
+                "supported: each of the three rewrites the mask, and stacking "
+                "them makes the arm uninterpretable. Run them separately.")
+        # Imported from the GeoFix package rather than reimplemented, so the
+        # writer and the reader of a pack cannot drift apart (a pack read under
+        # the wrong polarity preserves exactly what it meant to repair).
+        try:
+            from geofix.blend.containment_gate import load_pack, pack_key
+        except ImportError as e:
+            raise SystemExit(
+                f"--mask-pack needs geofix/src on PYTHONPATH ({e}). Add "
+                "`${GEOFIX_ROOT}/src` -- slurm/containment_gate.sbatch does.")
+        mask_pack, mask_pack_meta = load_pack(args.mask_pack)
+        print(f"[infer] mask-pack {args.mask_pack}: {len(mask_pack)} planes, "
+              f"family {mask_pack_meta.get('family')}, mean M_edit "
+              f"{float(np.mean(list(mask_pack.values()))):.4f}", flush=True)
+
     if args.mask_const is not None:
-        if not args.mask_in_camera:
+        if not (args.mask_in_camera or args.mask_in_camera_l0):
             raise SystemExit(
                 "--mask-const is the area-matched control for the camera-channel "
                 "mask and does nothing without --mask-in-camera. Add it, or drop "
@@ -548,7 +696,7 @@ def main() -> int:
                 "a control in name only.")
 
     if args.mask_transform != "none":
-        if not args.mask_in_camera:
+        if not (args.mask_in_camera or args.mask_in_camera_l0):
             raise SystemExit(
                 f"--mask-transform {args.mask_transform} rewrites the mask fed to "
                 "camera channel 0 and does nothing without --mask-in-camera. Add "
@@ -572,9 +720,25 @@ def main() -> int:
                 "supported: the sampling-time composite reads the real mask, so "
                 "the run would be a control in name only.")
 
-    if not (args.cond_artifact or args.mask_in_camera):
-        print("[infer] NOTE: neither slot enabled -- this is stock GLD generation "
-              "(session 6.5's arm A), which is a legitimate arm but not GeoFix.",
+    if not (args.cond_artifact or args.mask_in_camera
+            or args.cond_artifact_l0 or args.mask_in_camera_l0):
+        print("[infer] NOTE: no slot enabled at either level -- this is stock GLD "
+              "generation (session 6.5's arm A), which is a legitimate arm but "
+              "not GeoFix.", flush=True)
+    if args.cond_artifact_l0 or args.mask_in_camera_l0:
+        # Loud, every run, because the flags themselves cannot tell whether the
+        # cascade checkpoint behind them was finetuned. Nothing on disk records
+        # it either -- `da3_cascade.pt` carries only an `ema` key, no config --
+        # so this print plus the provenance below is the whole audit trail.
+        print("[infer] LEVEL-0 CONDITIONING ON (cond_artifact_l0="
+              f"{args.cond_artifact_l0}, mask_in_camera_l0="
+              f"{args.mask_in_camera_l0}). The RELEASED cascade "
+              "(da3_cascade.pt) has NEVER seen either input: it trained with an "
+              "all-zero condition slot and a spatially constant camera channel "
+              "0. If --checkpoint-cascade is the released file, this run "
+              "measures a DISTRIBUTION SHIFT, not a conditioning signal, and a "
+              "null from it is not a null about level-0 conditioning. Finetune "
+              "with configs/training/DA3_geofix_cascade.yaml first.",
               flush=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -632,8 +796,16 @@ def main() -> int:
     # a field that happened to parse as the wrong mode. So the value is hard rule 6
     # ("MAX, never MEAN") and the manifest string is CHECKED against it rather than
     # read from.
-    pooling = "max"
-    if "max" not in str(manifest["mask_pooling"]).lower():
+    #
+    # `--pooling` exists for the L2-ORACLE PAIR ONLY (`rms` and its area control
+    # `max_arearef_rms`, see `video.geofix_pairs.POOLING_MODES`). It MUST match the
+    # value the arm trained with: pooling is applied at load time, so a mask
+    # rms-pooled in training and max-pooled here is a different conditioning signal
+    # and nothing downstream would notice. Nothing records it in the checkpoint --
+    # the same parity gap the bridge_x0 gate exists to close -- so until the gate
+    # covers it, this flag is the operator's responsibility.
+    pooling = args.pooling
+    if pooling == "max" and "max" not in str(manifest["mask_pooling"]).lower():
         raise ValueError(
             f"manifest mask_pooling is {manifest['mask_pooling']!r}, which does not "
             f"mention MAX. Hard rule 6 requires max pooling to the token grid; a "
@@ -713,43 +885,87 @@ def main() -> int:
                     "loader emits ImageNet-normalised tensors and build_batch must "
                     "undo that, exactly as cut3r_adapter.convert_cut3r_batch does.")
             print(f"[infer] image range [{lo:.3f}, {hi:.3f}] OK", flush=True)
+        if mask_pack is not None:
+            # Replace the TARGET planes of the mask in place, before anything
+            # reads it -- the camera-channel path and the sampling-time composite
+            # both take `batch["mask"]`, so overriding here keeps them consistent
+            # instead of steering one and leaving the other on the manifest mask.
+            # Reference slots keep GeoFixPairs' zeros: they are clean photographs
+            # and the pack has no plane for them.
+            if batch["mask"].shape[2] != 1:
+                raise SystemExit(
+                    f"--mask-pack carries ONE plane per view but the manifest "
+                    f"stacks {batch['mask'].shape[2]}. Broadcasting one pack "
+                    "plane across several mask channels is a modelling decision, "
+                    "not this script's.")
+            m_new = torch.zeros_like(batch["mask"])
+            for k, stem in enumerate(stems):
+                key = pack_key(split, stem)
+                if key not in mask_pack:
+                    raise SystemExit(
+                        f"--mask-pack has no plane for {key}. Refusing to run: a "
+                        "missing plane defaults to zeros, which under `edit1` "
+                        "means KEEP THE RENDER everywhere -- a silently different "
+                        "arm, not a gap (hard rule 8).")
+                plane = torch.as_tensor(mask_pack[key], device=device,
+                                        dtype=batch["mask"].dtype)
+                if plane.shape != batch["mask"].shape[-2:]:
+                    raise SystemExit(
+                        f"--mask-pack plane {key} is {tuple(plane.shape)}, the "
+                        f"batch grid is {tuple(batch['mask'].shape[-2:])}.")
+                m_new[0, cond + k] = plane
+            batch["mask"] = m_new
         geo_batch = {k: batch[k] for k in ("image", "c2w", "intrinsic")}
 
-        art = None
-        if args.cond_artifact:
+        # ONE source image, selected once, then routed to whichever levels are
+        # switched on. Selecting it separately per level would let --cond-source
+        # mean two different things in one run -- e.g. the `shuffled` negative
+        # control drawing a different donor at each level, which would no longer
+        # be a control of anything.
+        art_img = None
+        if args.cond_artifact or args.cond_artifact_l0:
             if args.cond_source == "render":
-                art = batch["image"]
+                art_img = batch["image"]
             elif args.cond_source == "gt":
-                art = batch["gt"]
+                art_img = batch["gt"]
             elif args.cond_source == "zeros":
                 # Leave the slot at zeros, which IS stock GLD. Deliberately not a
                 # zero-valued image encoded through the RAE -- that would be the
                 # features of a black frame, not an empty slot.
-                art = None
+                art_img = None
             elif args.cond_source == "shuffled":
                 # A different sample's render, same shapes. Uses the NEXT index in the
                 # dataset rather than a random one so the arm is reproducible.
-                art = build_batch(dataset[(i + 1) % n], device)["image"]
-        msk = batch["mask"] if args.mask_in_camera else None
+                art_img = build_batch(dataset[(i + 1) % n], device)["image"]
+        art = art_img if args.cond_artifact else None
+        art_l0 = art_img if args.cond_artifact_l0 else None
+        # ONE mask tensor, controls applied ONCE, then routed per level. The
+        # alternative -- transforming the level-1 copy and handing level 0 the
+        # untouched manifest mask -- would make `--mask-transform shuffle` a
+        # control at one level and the real thing at the other, and the arm would
+        # still be called a control. With both level-0 flags off this is `msk`
+        # under a different name and every existing run is unchanged.
+        msk_any = (batch["mask"]
+                   if (args.mask_in_camera or args.mask_in_camera_l0) else None)
         # The mask-modulated bridge needs the mask even with slot 2 OFF --
         # that combination is the arm that isolates the transport schedule
         # from the input channel.
         msk_bridge = batch["mask"] if args.bridge_mask_noise else None
-        if msk is not None and msk.shape[2] != 1:
+        if msk_any is not None and msk_any.shape[2] != 1:
             raise ValueError(
                 f"camera-channel injection takes ONE mask plane, manifest stacks "
-                f"{msk.shape[2]}. Reducing several planes to one is a modelling "
+                f"{msk_any.shape[2]}. Reducing several planes to one is a modelling "
                 "decision; make it explicitly rather than here.")
-        if msk is not None and args.mask_const is not None:
+        if msk_any is not None and args.mask_const is not None:
             # Placement out, area held. Recorded per sample so the provenance can
             # state the area this control actually ran at.
-            msk, const_area = constant_mask(msk, args.mask_const, cond)
+            msk_any, const_area = constant_mask(msk_any, args.mask_const, cond)
             const_areas.append(const_area)
             if done == 0:
                 print(f"[infer] mask-const {args.mask_const!r}: uniform plane, "
                       f"mean {const_area:.4f} on target views", flush=True)
 
-        if msk is not None and args.mask_transform != "none":
+        if msk_any is not None and args.mask_transform != "none":
             # Placement destroyed, values untouched (except `invert`, which IS the
             # flip). Areas are recorded per sample on BOTH sides so a control arm
             # can never be read as a real one.
@@ -765,8 +981,8 @@ def main() -> int:
                 # random one, so the arm is reproducible and shard-invariant.
                 donor = build_batch(dataset[donor_i], device)["mask"]
                 donor_indices.append([i, donor_i])
-            msk, area_pre, area_post, tinfo = transform_mask(
-                msk, args.mask_transform, cond, i, donor=donor)
+            msk_any, area_pre, area_post, tinfo = transform_mask(
+                msk_any, args.mask_transform, cond, i, donor=donor)
             tf_area_pre.append(area_pre)
             tf_area_post.append(area_post)
             if "roll" in tinfo:
@@ -777,6 +993,11 @@ def main() -> int:
                       + (f", roll {tinfo['roll']}" if "roll" in tinfo else "")
                       + (f", donor {donor_indices[-1][1]}" if donor_indices else ""),
                       flush=True)
+
+        # Route AFTER the controls, so both levels see the same tensor the arm's
+        # name describes.
+        msk = msk_any if args.mask_in_camera else None
+        msk_l0 = msk_any if args.mask_in_camera_l0 else None
 
         feat, feat_denorm = {}, {}
         blend1 = None
@@ -828,7 +1049,11 @@ def main() -> int:
         )
         feat_denorm[1] = rae._denormalize(feat[1])
 
-        # --- stage 2: L1 -> L0, the learned cascade (UNCHANGED, released) -----
+        # --- stage 2: L1 -> L0, the learned cascade ---------------------------
+        # UNCHANGED and byte-identical to the released path unless one of the two
+        # level-0 flags is set: `geofix_artifact_images=None`, `geofix_mask=None`
+        # and `geofix_gamma=1.0` are the defaults inside get_cascade_features and
+        # each is an explicit skip, not a multiply-by-one.
         torch.manual_seed(args.seed + i + 1)
         torch.cuda.manual_seed_all(args.seed + i + 1)
         feat[0] = get_cascade_features(
@@ -841,6 +1066,13 @@ def main() -> int:
             use_camera_drop=ctx["use_camera_drop"],
             cfg_uncond_mode=ctx["cfg_uncond_mode"], noise_tau=0.0,
             prope_image_size=ctx["hw"], eval_mode="cascade",
+            geofix_artifact_images=art_l0, geofix_mask=msk_l0,
+            # The RESIDUAL exponent, not the absolute one: GeoFixPairs already
+            # raised this mask to `--gamma` at load time, and
+            # (m ** gamma) ** (gamma_l0 / gamma) == m ** gamma_l0 exactly for
+            # m >= 0. 1.0 whenever --gamma-level0 is unset or equal to --gamma,
+            # which is the branch get_cascade_features skips entirely.
+            geofix_gamma=gamma_ratio_l0,
         )
         rae.level = 0
         rae._init_normalization(stat_path=stat_path[0])
@@ -969,6 +1201,11 @@ def main() -> int:
         "samples_skipped_complete": skipped,
         "dump_depth": bool(args.dump_depth),
         "blend_mask": bool(args.blend_mask),
+        # WHICH mask ran. `mask_types` below names the manifest's mask, which a
+        # pack overrides entirely -- without this the two arms of the containment
+        # gate would be indistinguishable on disk from a plain oracle blend.
+        "mask_pack": args.mask_pack,
+        "mask_pack_meta": mask_pack_meta,
         # There is no way to recover these from the checkpoint file, so a
         # mismatch between how a bridge was trained and how it was sampled
         # would be unrecoverable after the fact. Record them.
@@ -977,6 +1214,28 @@ def main() -> int:
         "bridge_mask_noise": bool(args.bridge_mask_noise),
         "cond_artifact": bool(args.cond_artifact),
         "mask_in_camera": bool(args.mask_in_camera),
+        # LEVEL 0. Recorded unconditionally, including the False/False default,
+        # so that an arm directory can be told apart from one written before
+        # these flags existed by the PRESENCE of the keys rather than by their
+        # absence -- an absent key is indistinguishable from an old run, and
+        # "which arm produced this directory" is the question provenance exists
+        # to answer.
+        "cond_artifact_l0": bool(args.cond_artifact_l0),
+        "mask_in_camera_l0": bool(args.mask_in_camera_l0),
+        "gamma_level0": gamma_l0,
+        "gamma_level0_residual_exponent": gamma_ratio_l0,
+        # The caveat, in the file, next to the numbers it qualifies. A reader
+        # who finds a level-0 arm months from now needs to know whether the
+        # cascade behind it was ever finetuned, and nothing in da3_cascade.pt
+        # records that -- it holds an `ema` key and nothing else.
+        "cascade_conditioning_note": (
+            "The RELEASED da3_cascade.pt was trained with an all-zero condition "
+            "slot and a spatially CONSTANT camera channel 0. If "
+            "checkpoint_cascade is that file and either level-0 flag is true, "
+            "this arm measures an off-distribution input, not a conditioning "
+            "signal."
+            if (args.cond_artifact_l0 or args.mask_in_camera_l0)
+            else "level-0 conditioning off; cascade path is the released one."),
         "mask_types": list(manifest["mask_types"]),
         "mask_polarity": manifest["mask_polarity"],
         "mask_pooling": pooling,
