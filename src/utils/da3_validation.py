@@ -67,9 +67,45 @@ def validate_da3_multiview(
     # NEW: Feature Propagation Mode (Image 1 Architecture)
     source_condition_level=None,  # L1 features for encoder conditioning (not x0 init)
     source_condition_stat_path=None,  # Normalization stat path for source condition level
-    # GeoFix session 8: the same two conditioning slots `prepare_data` fills.
+    # ------------------------------------------------------------------
+    # GeoFix session 8/9. EVERY route by which the mask or the render reaches the
+    # model at TRAINING time has to be reproducible here, or in-loop validation
+    # measures a different task than the one being trained -- and the number it
+    # prints is finite and plotted, which is worse than absent.
+    #
+    # Until 2026-08-27 only the first two existed, and the two consequences were
+    # both measured rather than suspected:
+    #
+    #   * a BRIDGE-trained model was validated FROM A NOISE START it had never
+    #     seen. Its `val/loss_ref` climbed 0.0786 -> 0.5016 over the run while an
+    #     otherwise identical noise arm went 0.0786 -> 0.0674. Reading that curve
+    #     as "the bridge diverges" is the obvious mistake and it is wrong: the
+    #     model was scored on an x0 it does not fit.
+    #   * the `gt_clean` swap was gated on `cond_artifact` alone while the trainer
+    #     gates it on `clean_target`, so the NVS CONTROL -- the arm defined by
+    #     `--geofix-no-cond-artifact --geofix-no-mask --geofix-clean-target` --
+    #     had its PSNR measured against the ARTIFACT RENDER rather than the clean
+    #     photograph. A control scored against the wrong reference is not a
+    #     control.
+    #
+    # `tests/test_val_geofix_reflection.py` asserts, by reflection, that every
+    # `geofix_*` setting the trainer resolves has a parameter here. Adding a
+    # training-time route without adding it to this signature now fails a test
+    # instead of producing a plausible curve.
+    # ------------------------------------------------------------------
     geofix_cond_artifact=False,  # fill cond_channel[:, cond_num:] with render features
     geofix_mask_in_camera=False,  # grade camera channel 0 by M_edit on the target half
+    geofix_clean_target=False,   # supervise/score against gt_clean, not the render
+    geofix_bridge_x0=None,       # 'artifact' -> x0 is F_render, not N(0, I)
+    geofix_bridge_noise_tau=0.0,  # sigma for the bridge start perturbation
+    geofix_bridge_mask_noise=False,  # sigma_i = tau * M_edit_i, per token
+    geofix_blend_train=False,    # composite x_t toward F_render under the mask
+    # The armed `stage2.transport.blending.LatentBlend` the SAMPLER was built
+    # with, when `geofix_blend_train` is on. It cannot be created here: the blend
+    # is a `blend_fn` hook baked into `Sampler.sample_ode` at construction time,
+    # and this function receives the already-built `sampler`. The caller owns it;
+    # this function re-arms it per batch and disarms it on the way out.
+    geofix_blend_hook=None,
 ):
     """
     Shared validation/inference logic for DA3 MVDiffusion.
@@ -85,6 +121,50 @@ def validate_da3_multiview(
     """
 
     print(f"Validation mode: {validation_mode}")
+
+    # ------------------------------------------------------------------
+    # Resolve the GeoFix routes ONCE, and refuse the combinations that cannot be
+    # reproduced here. Failing loudly at the top beats validating something else
+    # for the whole run: the whole class of defect this block exists for is
+    # "finite, plotted, and not what was trained".
+    # ------------------------------------------------------------------
+    geofix_bridge = (geofix_bridge_x0 == "artifact")
+    if geofix_bridge_x0 not in (None, "", "noise", "artifact"):
+        raise ValueError(
+            f"geofix_bridge_x0={geofix_bridge_x0!r}; the only implemented value is "
+            "'artifact' (or None/'noise' for the stock start). Silently treating an "
+            "unknown string as noise is how a bridge arm gets validated from noise.")
+    if geofix_bridge_mask_noise and not geofix_bridge:
+        raise ValueError(
+            "geofix_bridge_mask_noise without geofix_bridge_x0='artifact': there is "
+            "no per-token transport distance to modulate, and scaling N(0, I) would "
+            "be a spatially varying SNR -- a different arm. Mirrors the identical "
+            "refusal in train_multiview_da3.")
+    # Anything that needs the render encoded. Kept as one expression so this file
+    # and the trainer cannot drift on WHICH routes consume it.
+    geofix_needs_artifact = bool(geofix_cond_artifact or geofix_bridge or geofix_blend_train)
+    # Anything that needs the mask. `mask_in_camera` is only one of three.
+    geofix_needs_mask = bool(geofix_mask_in_camera or geofix_bridge_mask_noise
+                             or geofix_blend_train)
+    if geofix_needs_artifact and not geofix_clean_target:
+        raise ValueError(
+            "a GeoFix route that consumes the render is on but "
+            "geofix_clean_target=False, so `images` would stay the ARTIFACT RENDER "
+            "and every val/psnr_* below would score the model against its own "
+            "degraded input. The trainer's default ties these together; pass the "
+            "trainer's resolved `clean_target`, not `cond_artifact`.")
+    if geofix_blend_train and geofix_blend_hook is None:
+        raise ValueError(
+            "geofix_blend_train=True but no geofix_blend_hook was given. Training "
+            "composites x_t toward the artifact latents inside "
+            "`training_multiview_losses`; SAMPLING can only do it through the "
+            "`blend_fn` hook that `Sampler.sample_ode` is BUILT with, and this "
+            "function is handed an already-built sampler. Construct a "
+            "`stage2.transport.blending.LatentBlend`, pass it as "
+            "`sample_ode(blend_fn=...)`, and hand the same object here. Sampling "
+            "without it would score a blend-trained model on an unblended "
+            "trajectory -- the exact train/test mismatch this argument exists to "
+            "prevent.")
     
     all_images = []
     saved_sample_count = 0  # Counter for saved samples
@@ -94,6 +174,15 @@ def validate_da3_multiview(
     per_sample_metrics = []  # List of per-sample metrics
 
     val_loss_sum = torch.tensor(0.0, device=device)
+    # GeoFix edit/keep split of the TARGET loss, the validation twin of the
+    # training-time diagnostic. Its own counter, not `val_loss_count`: the
+    # transport emits the split only when the mask is neither all-0 nor all-1 on
+    # a batch, so the two denominators genuinely differ and sharing one would
+    # quietly scale the split toward zero on the batches that produced none.
+    val_edit_loss_sum = torch.tensor(0.0, device=device)
+    val_keep_loss_sum = torch.tensor(0.0, device=device)
+    val_mask_frac_sum = torch.tensor(0.0, device=device)
+    val_geofix_count = torch.tensor(0.0, device=device)
     val_ref_loss_sum = torch.tensor(0.0, device=device) # Split Loss
     val_tgt_loss_sum = torch.tensor(0.0, device=device) # Split Loss
     val_loss_count = torch.tensor(0.0, device=device)
@@ -130,6 +219,24 @@ def validate_da3_multiview(
     m = model.module if hasattr(model, 'module') else model
     if predict_cls is None:
         predict_cls = getattr(m, 'predict_cls', False)
+
+    # The GeoFix transport routes are implemented on ONE path -- concat mode,
+    # spatial latents -- because that is the only path session 8/9 trains on. The
+    # packed-CLS format has no token grid to align a 36x36 mask to and the
+    # target-only path clamps the reference views, so silently running either
+    # would validate a different construction than the one trained. Refuse.
+    if (geofix_bridge or geofix_blend_train) and (predict_cls or not is_concat_mode):
+        raise ValueError(
+            f"geofix bridge/blend validation needs is_concat_mode=True and "
+            f"predict_cls=False; got is_concat_mode={is_concat_mode}, "
+            f"predict_cls={predict_cls}. In the packed-CLS format there is no "
+            "token grid to align the mask to, and in target-only mode the "
+            "reference views are clamped -- neither reproduces what training did.")
+    if geofix_bridge and source_level is not None:
+        raise ValueError(
+            "geofix_bridge_x0 and source_level both write the x0 end of the flow; "
+            "the second would overwrite the first and validation would look like a "
+            "bridge while being a cross-level flow. Same refusal as the trainer.")
     
     for i, batch in pbar:
         if val_num_batches is not None and i >= val_num_batches:
@@ -161,20 +268,47 @@ def validate_da3_multiview(
         # would be finite, plotted, and meaningless, which is worse than absent.
         # ------------------------------------------------------------------
         geofix_artifact_images = None
-        geofix_mask = None
-        if geofix_cond_artifact:
+        geofix_mask = None          # slot 2 only: the camera-channel-0 grading
+        geofix_mask_tokens = None   # the mask itself, for ANY of its three routes
+        # GATED ON `clean_target`, NOT ON `cond_artifact` (fixed 2026-08-27).
+        # `train_multiview_da3` gates the swap on `geofix_clean_target`, which
+        # defaults to `cond_artifact or bridge or blend_train` but is settable
+        # ALONE -- and set alone is exactly the NVS control. Gating on
+        # `cond_artifact` here scored that control against the render.
+        if geofix_clean_target:
             if 'gt_clean' not in batch:
                 raise ValueError(
-                    "geofix_cond_artifact=True but the batch has no 'gt_clean'. "
+                    "geofix_clean_target=True but the batch has no 'gt_clean'. "
                     "Only the GeoFix loader supplies it; check dataset.name=geofix.")
             geofix_artifact_images = images                      # the render -> cond slot
             images = batch['gt_clean'].to(device)                # the clean frame -> target
-        if geofix_mask_in_camera:
+        if not geofix_needs_artifact:
+            # Nothing consumes the render: no slot-1 fill, no bridge x0, no blend.
+            # Dropping it keeps the encode unpaid and makes the arm provably
+            # render-free, exactly as the trainer does.
+            geofix_artifact_images = None
+        if geofix_needs_mask:
             if 'mask' not in batch:
                 raise ValueError(
-                    "geofix_mask_in_camera=True but the batch has no 'mask'. "
-                    "Only the GeoFix loader supplies it; check dataset.name=geofix.")
-            geofix_mask = batch['mask'].to(device)
+                    "a GeoFix route that consumes the mask (mask_in_camera / "
+                    "bridge_mask_noise / blend_train) is on but the batch has no "
+                    "'mask'. Only the GeoFix loader supplies it; check "
+                    "dataset.name=geofix.")
+            geofix_mask_tokens = batch['mask'].to(device)
+            # Same invariant the training step and `geofix_infer.assert_ref_slots_zero`
+            # enforce, and for the same reason: `bridge_mask_noise` builds
+            # `sigma = tau * M_edit` over ALL views, so a nonzero reference plane
+            # would noise the clean conditioning views.
+            if geofix_mask_tokens[:, :cond_num].abs().max() > 0:
+                raise ValueError(
+                    "reference slots [0, cond_num) carry a nonzero mask; "
+                    "GeoFixPairs emits zeros there and bridge_mask_noise's "
+                    "sigma = tau * M_edit runs over ALL views.")
+        if geofix_mask_in_camera:
+            # Slot 2 gets the mask ONLY when slot 2 is on. Binding it from
+            # `geofix_needs_mask` would silently switch the camera channel on for
+            # every bridge_mask_noise / blend_train arm and collapse the 2x2.
+            geofix_mask = geofix_mask_tokens
 
         B, V, C, H, W = images.shape
         
@@ -318,6 +452,9 @@ def validate_da3_multiview(
         # above and `prepare_data` -- the encoder statistics are not optional
         # (hard rule 5's calibration depends on this path being the same one).
         geofix_latents_art = None
+        # None on every non-bridge path, which is how `training_multiview_losses`
+        # keeps its stock behaviour of sampling x0 ~ N(0, I) internally.
+        geofix_x0_flat = None
         if geofix_artifact_images is not None:
             if geofix_artifact_images.shape != images.shape:
                 raise ValueError(
@@ -425,6 +562,64 @@ def validate_da3_multiview(
                         noise_std = 0.0
                     noise = torch.randn_like(latents_source_5d) * noise_std
                     noisy_part = (latents_source_5d + noise) / math.sqrt(1 + noise_std**2)
+                elif geofix_bridge:
+                    # ------------------------------------------------------
+                    # THE BRIDGE START. A bridge-trained velocity field was only
+                    # ever fitted on x_t interpolating F_render -> F_clean; started
+                    # from N(0, I) it is being evaluated off its own support, and
+                    # the sampled frames are not a worse version of the trained
+                    # model, they are a different model. This mirrors
+                    # `train_multiview_da3`'s `x0_init` and
+                    # `da3_validation_metric`'s inference path -- including the
+                    # renormalisation by sqrt(1 + sigma^2), which is not cosmetic:
+                    # it is what keeps the perturbed start on the variance the
+                    # path sampler assumes.
+                    #
+                    # ALL V VIEWS, not just the target half, matching training:
+                    # `training_multiview_losses` receives the whole x0 tensor and
+                    # (in concat mode) does not clamp the reference half. The
+                    # integrator zeroes the reference views' velocity anyway, so
+                    # they hold their start either way -- the parity argument is
+                    # what makes it the right start, not a numerical difference.
+                    # ------------------------------------------------------
+                    if geofix_latents_art is None:
+                        raise ValueError(
+                            "geofix_bridge_x0='artifact' but no artifact latents were "
+                            "encoded, so there is nothing to bridge from. Falling back "
+                            "to noise would validate a bridge model on a start it "
+                            "never trained on.")
+                    art_5d = geofix_latents_art.reshape(
+                        B, V, latent_dim, h_lat, w_lat).to(gt_latents.dtype)
+                    if geofix_bridge_mask_noise:
+                        # sigma_i = tau * M_edit_i, per token -- tau used directly
+                        # rather than resampled as |N(0, tau^2)|, exactly as in
+                        # training: the mask is already the source of variation
+                        # across tokens and a per-step scalar would blur it.
+                        if geofix_mask_tokens is None:
+                            raise ValueError(
+                                "geofix_bridge_mask_noise is on but no mask reached "
+                                "validation.")
+                        m_b = geofix_mask_tokens.to(dtype=gt_latents.dtype)
+                        if m_b.shape[-2:] != (h_lat, w_lat):
+                            raise ValueError(
+                                f"mask grid {tuple(m_b.shape[-2:])} != latent grid "
+                                f"{(h_lat, w_lat)}; the mask is MAX-pooled to the token "
+                                "grid at load time and must match it exactly "
+                                "(hard rule 6).")
+                        sigma = geofix_bridge_noise_tau * m_b.reshape(
+                            B, V, 1, h_lat, w_lat)
+                    else:
+                        sigma = float(geofix_bridge_noise_tau)
+                    noisy_part = (
+                        (art_5d + torch.randn_like(art_5d) * sigma)
+                        / (1 + sigma ** 2) ** 0.5
+                    )
+                    # The SAME draw is handed to `training_multiview_losses` as
+                    # its x0 below. Reusing it rather than redrawing is what makes
+                    # `val/loss` and the sampled frames two views of one
+                    # trajectory instead of two unrelated ones.
+                    geofix_x0_flat = noisy_part.reshape(
+                        B * V, latent_dim, h_lat, w_lat)
                 else:
                     # Standard diffusion: pure noise
                     noisy_part = torch.randn(B, V, latent_dim, h_lat, w_lat, device=device, dtype=gt_latents.dtype)
@@ -477,7 +672,19 @@ def validate_da3_multiview(
                 # is the slot session 6.5 never used: there the render reached the
                 # model only as a sampling-time overwrite of x_t, never as
                 # conditioning the network could read.
-                if geofix_latents_art is not None:
+                # `geofix_cond_artifact` and NOT merely "the artifact latents
+                # exist" (tightened 2026-08-27). They now also exist for a
+                # bridge-only or blend-only arm, which consume them at the x0 end
+                # and must leave this slot at ZEROS -- filling it would hand those
+                # arms a conditioning signal they were never trained with, and
+                # separating {render as conditioning} from {render as x0} is the
+                # whole point of having both flags.
+                if geofix_cond_artifact:
+                    if geofix_latents_art is None:
+                        raise ValueError(
+                            "geofix_cond_artifact=True but no artifact latents were "
+                            "encoded; the target slots would stay zeros and the arm "
+                            "would validate as stock GLD.")
                     cond_channel[:, cond_num:] = geofix_latents_art.reshape(
                         B, V, latent_dim, h_lat, w_lat)[:, cond_num:].to(cond_channel.dtype)
 
@@ -574,6 +781,32 @@ def validate_da3_multiview(
                 else:
                     loss_input = loss_latents
 
+                # ------------------------------------------------------
+                # REPRODUCE THE TRAINING-TIME CONSTRUCTION, not a stock one.
+                # `val/loss*` is the only per-step signal this run emits, and it
+                # is only comparable with `train/loss*` if x_t is built the same
+                # way. The bridge is the case that made this visible: validated
+                # from noise, a bridge arm's `val/loss_ref` ran 0.0786 -> 0.5016
+                # while a noise arm went 0.0786 -> 0.0674 -- a curve that invites
+                # "the bridge diverges" and means "the x0 is wrong".
+                #
+                # The mask diagnostic rides along for the same reason it does in
+                # training: it changes no value here (no gradients are taken at
+                # all under `no_grad`), but without it `val/loss_edit` and
+                # `val/loss_keep` are simply absent for the arms whose whole
+                # claim is about the edit/keep split.
+                # ------------------------------------------------------
+                if geofix_mask_tokens is not None:
+                    m_kwargs_loss['geofix_mask_tokens'] = geofix_mask_tokens
+                if geofix_blend_train:
+                    if geofix_latents_art is None:
+                        raise ValueError(
+                            "geofix_blend_train=True but no artifact latents were "
+                            "encoded; there is nothing to composite toward and the "
+                            "validation loss would silently be the unblended one.")
+                    m_kwargs_loss['geofix_blend_tokens'] = geofix_mask_tokens
+                    m_kwargs_loss['geofix_blend_toward'] = geofix_latents_art
+
                 loss_dict = transport.training_multiview_losses(
                     model=model,
                     x1=loss_input,
@@ -581,6 +814,7 @@ def validate_da3_multiview(
                     cond_num=cond_num,
                     model_kwargs=m_kwargs_loss,
                     t_override=0.5,  # Fixed timestep for validation
+                    x0=geofix_x0_flat,
                 )
                 loss_batch = loss_dict["loss"].mean()
                 if not torch.isfinite(loss_batch).all():
@@ -590,14 +824,51 @@ def validate_da3_multiview(
                 ref_loss_batch = loss_dict.get("ref_loss", loss_dict["loss"]).mean()
                 tgt_loss_batch = loss_dict.get("tgt_loss", loss_dict["loss"]).mean()
                 
+                if "loss_edit" in loss_dict and "loss_keep" in loss_dict:
+                    val_edit_loss_sum += loss_dict["loss_edit"].mean().float()
+                    val_keep_loss_sum += loss_dict["loss_keep"].mean().float()
+                    val_mask_frac_sum += loss_dict["mask_edit_frac"].mean().float()
+                    val_geofix_count += 1.0
+
                 val_loss_sum += loss_batch * float(loss_latents.shape[0])
                 val_ref_loss_sum += ref_loss_batch * float(loss_latents.shape[0])
                 val_tgt_loss_sum += tgt_loss_batch * float(loss_latents.shape[0])
                 val_loss_count += float(loss_latents.shape[0])
 
+        # ------------------------------------------------------------------
+        # ARM THE BLEND FOR THIS BATCH. `LatentBlend` holds the batch's artifact
+        # features and mask, so it has to be re-armed every batch; the sampler
+        # itself was built with this object as its `blend_fn` and cannot be
+        # rebuilt here. Arming per batch and disarming after the loop is the only
+        # ordering that leaves the hook inert for every other caller of the same
+        # sampler.
+        #
+        # `n_calls` is checked below for the same reason `geofix_infer` checks it:
+        # a hook that never fires returns the UNBLENDED arm while the run reports
+        # a blend, and every metric looks ordinary.
+        # ------------------------------------------------------------------
+        if geofix_blend_hook is not None:
+            if geofix_latents_art is None or geofix_mask_tokens is None:
+                raise ValueError(
+                    "geofix_blend_hook was given but this batch produced no artifact "
+                    "latents or no mask; the sampler would run unblended while the "
+                    "run reports a blend.")
+            _bv = B * V
+            geofix_blend_hook.arm(
+                geofix_latents_art.reshape(_bv, latent_dim, h_lat, w_lat),
+                geofix_mask_tokens.reshape(_bv, 1, h_lat, w_lat).to(gt_latents.dtype),
+            )
+
         with torch.no_grad():
             # Pass model directly (transport now handles positional total_view)
             samples = sampler(sample_input_flat, model, **model_kwargs)[-1]  # (B*V, C, H, W) or (B*V, C, N+1, 1)
+
+        if geofix_blend_hook is not None and geofix_blend_hook.n_calls == 0:
+            raise RuntimeError(
+                "geofix_blend_hook was armed but the sampler never called it, so "
+                "these frames are the UNBLENDED arm under a blend arm's name. The "
+                "hook has to be passed as `Sampler.sample_ode(blend_fn=...)` at "
+                "construction; passing it only here is not enough.")
 
         if is_concat_mode:
             # Extract only the denoised part (second half of channels)
@@ -1186,6 +1457,13 @@ def validate_da3_multiview(
         
             
 
+    # Leave the shared sampler exactly as it was found. The hook lives on the
+    # `eval_sampler` the trainer built once, so an armed hook that survives this
+    # call would blend somebody else's batch against THIS batch's stale artifact
+    # features -- a wrong answer, not an error.
+    if geofix_blend_hook is not None:
+        geofix_blend_hook.disarm()
+
     # Aggregate all metrics across ranks
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
@@ -1193,6 +1471,10 @@ def validate_da3_multiview(
         dist.all_reduce(val_ref_loss_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(val_tgt_loss_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(val_loss_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_edit_loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_keep_loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_mask_frac_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_geofix_count, op=dist.ReduceOp.SUM)
         
         # Split Metrics aggregation
         dist.all_reduce(psnr_tgt_sum, op=dist.ReduceOp.SUM)
@@ -1256,6 +1538,10 @@ def validate_da3_multiview(
             stats["val/loss"] = (val_loss_sum / val_loss_count).item()
             stats["val/loss_ref"] = (val_ref_loss_sum / val_loss_count).item()
             stats["val/loss_tgt"] = (val_tgt_loss_sum / val_loss_count).item()
+            if val_geofix_count.item() > 0:
+                stats["val/loss_edit"] = (val_edit_loss_sum / val_geofix_count).item()
+                stats["val/loss_keep"] = (val_keep_loss_sum / val_geofix_count).item()
+                stats["val/mask_edit_frac"] = (val_mask_frac_sum / val_geofix_count).item()
         else:
             print("[Warning] Validation loss requested but no samples processed.")
     
