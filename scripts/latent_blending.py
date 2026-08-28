@@ -85,6 +85,7 @@ import sys
 import time
 
 import numpy as np
+import re
 import torch
 
 SRC = pathlib.Path(__file__).resolve().parents[1] / "src"
@@ -714,6 +715,38 @@ def build_context(args, device) -> dict:
         ckpt = torch.load(path, map_location="cpu")
         sd = ckpt.get("ema", ckpt.get("model", ckpt))
         sd = {k.replace("module.", ""): v for k, v in sd.items()}
+        # DROP EXACT ALIAS DUPLICATES BEFORE LOADING -- and only those.
+        #
+        # `DDT_old` aliases `s_embedder_ref = s_embedder_tgt = s_embedder` (and
+        # likewise for x), so `named_parameters()` dedups to 378 tensors while a
+        # checkpoint SAVED from the training-side `DDT` class lists the same
+        # tensors under all three names, 386 in total. Loading such a checkpoint
+        # here therefore reports 8 UNEXPECTED keys -- the exact mirror of the 8
+        # MISSING keys the docstring above describes for the opposite direction,
+        # and equally cosmetic.
+        #
+        # This is NOT a relaxation of the check below. A key is dropped only when
+        # its alias target is present in the same state_dict AND the two tensors
+        # are bitwise equal, i.e. when dropping it provably cannot change what is
+        # loaded. Anything else -- a `_ref` that differs from its base, or one
+        # whose base is absent -- survives to the unexpected list and still
+        # raises, because there it would mean a genuinely different architecture.
+        # First needed by the level-0 cascade finetune (2026-08-28), which is the
+        # first checkpoint this project has trained for an "old"-mode config.
+        _alias = re.compile(r"^(?P<stem>[sx]_embedder)_(?:ref|tgt)\.(?P<rest>.+)$")
+        _dropped = []
+        for k in list(sd):
+            m = _alias.match(k)
+            if not m:
+                continue
+            base = f"{m.group('stem')}.{m.group('rest')}"
+            if base in sd and sd[base].shape == sd[k].shape and torch.equal(sd[base], sd[k]):
+                del sd[k]
+                _dropped.append(k)
+        if _dropped:
+            print(f"[6.5] {tag}: dropped {len(_dropped)} exact alias duplicates "
+                  f"(e.g. {_dropped[0]}); every one was bitwise equal to its base tensor",
+                  flush=True)
         res = model.load_state_dict(sd, strict=False)
         print(f"[6.5] {tag}: missing={len(res.missing_keys)} unexpected={len(res.unexpected_keys)}",
               flush=True)
