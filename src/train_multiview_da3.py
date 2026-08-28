@@ -1015,6 +1015,18 @@ def main(args):
         "mask_types": list(_ds.get("mask_types", []) or []),
         "pooling": _ds.get("pooling", "max"),
         "gamma": float(_ds.get("gamma", 1.0)),
+        # ADDED 2026-08-28, and its absence was a real hole in this dict.
+        # `contrast_soft` is the fixed S-curve the loader applies AFTER gamma
+        # (`video/geofix_pairs.py`), so it changes the conditioning signal exactly
+        # as `pooling` and `gamma` do. Without it, `contrast_abs` and
+        # `contrast_abs_nocurve` -- which are the curve ablation, differing ONLY in
+        # this value -- wrote BYTE-IDENTICAL geofix dicts. A scorer reading
+        # provenance from the checkpoint could not tell them apart, and
+        # `arm_train_test_gate` could not check it because it was in neither the
+        # checkpoint nor the gate's CHECKS table. That is the same defect class F3
+        # was written to close, in a knob added after F3 landed.
+        "contrast_soft": (None if _ds.get("contrast_soft") is None
+                          else float(_ds["contrast_soft"])),
     }
 
     if rank == 0:
