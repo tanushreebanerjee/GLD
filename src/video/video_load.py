@@ -658,6 +658,24 @@ def create_multiview_dataloader(
             token_grid=int(dataset_kwargs.get("token_grid", 36)),
             gamma=float(dataset_kwargs.get("gamma", 1.0)),
             pooling=str(dataset_kwargs.get("pooling", "max")),
+            # BOTH OF THESE WERE MISSING, and `contrast_soft` silently was for the
+            # entire life of the contrast ablation. `GeoFixPairs` accepts it, the
+            # config sets it, `train_multiview_da3` RECORDS it in the checkpoint's
+            # geofix dict and the parity gate CHECKS it -- and this call, the only
+            # construction site, never passed it, so it defaulted to None and the
+            # S-curve was never applied to a single training batch.
+            #
+            # Every guard missed it because every guard compares CONFIG to CONFIG.
+            # The gate verified that the config said 10.0 and the checkpoint said
+            # 10.0; both were true; the dataloader ignored both. A knob is only
+            # honoured if something reads it at the point of use, and hard rule 14
+            # has to mean "wired end to end", not "recorded in the dict".
+            #
+            # The cost: `contrast_abs` and `contrast_abs_nocurve` were the SAME
+            # experiment run twice, and the -0.326 dB between them at s4500 is a
+            # measurement of training run-to-run variance, not of the S-curve.
+            contrast_soft=dataset_kwargs.get("contrast_soft"),
+            sevref_scale=float(dataset_kwargs.get("sevref_scale", 1.0)),
             return_gt=True,
         )
         if len(dataset) == 0:

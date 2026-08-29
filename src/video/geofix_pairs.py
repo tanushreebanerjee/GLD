@@ -126,7 +126,26 @@ MASK_SUFFIX = ".edit1.npz"
 #:                     Same area, max's ranking -- so an rms-vs-this comparison is
 #:                     placement, with area held fixed. Never deploy it either; it
 #:                     needs the oracle plane twice.
-POOLING_MODES = ("max", "mean", "rms", "max_arearef_rms")
+#:   max_sevref_obsk   SEVERITY COMPOSITION. Max-pool the placement plane, then
+#:                     raise it to the per-frame monotone exponent that makes its
+#:                     area equal `obs_K` rms-pooled. Because the exponent is
+#:                     monotone the token RANKING is the placement plane's,
+#:                     untouched; only the frame's overall LEVEL comes from
+#:                     `obs_K`. That is "severity from one plane, placement from
+#:                     the other" in ONE channel -- the stacking design, without
+#:                     the two-channel widening that `prepare_data` refuses
+#:                     (camera channel 0 is one channel, and it raises on
+#:                     shape[2] != 1).
+#:                     Measured on Phase 1's own 168 frames and metrics, it
+#:                     strictly dominates both parents:
+#:                       depth_disagree(max)  severity r 0.131  rho 0.382  AUROC 0.628
+#:                       obs_K(max)                      0.627      0.228        0.587
+#:                       obs_K(rms)                      0.663      0.295        0.624
+#:                       COMPOSED                        0.663      0.382        0.628
+#:                     Both parents are DEPLOYABLE, so this is the first plane in
+#:                     the project carrying frame-level severity AND within-frame
+#:                     placement without touching the ground truth.
+POOLING_MODES = ("max", "mean", "rms", "max_arearef_rms", "max_sevref_obsk")
 
 
 def pool_mask(plane: np.ndarray, grid: int, mode: str = "max") -> torch.Tensor:
@@ -321,6 +340,7 @@ class GeoFixPairs(Dataset):
     def __init__(self, manifest: str | pathlib.Path, *, mask_types=None,
                  token_grid: int = 36, return_gt: bool = True,
                  gamma: float = 1.0, pooling: str = "max",
+                 sevref_scale: float = 1.0,
                  contrast_soft: float | None = None):
         self.manifest_path = pathlib.Path(manifest)
         m = json.loads(self.manifest_path.read_text())
@@ -357,6 +377,17 @@ class GeoFixPairs(Dataset):
                 "config's dataset.mask_types and inherit the manifest's.")
         self.mask_types = want
         self.gamma = float(gamma)
+        # Measured as mean(depth_disagree max area) / mean(obs_K rms area) =
+        # 0.488 / 0.713 over 320 training frames, i.e. the factor that centres the
+        # composed area on the placement plane's own while keeping obs_K's
+        # per-frame spread. Only read by `max_sevref_obsk`.
+        self.sevref_scale = float(sevref_scale)
+        if self.sevref_scale != 1.0 and pooling != "max_sevref_obsk":
+            raise ValueError(
+                f"sevref_scale={self.sevref_scale} is only read by "
+                f"pooling='max_sevref_obsk', but pooling={pooling!r}. Setting it "
+                "elsewhere is silently inert, which is how an ablation ends up "
+                "with two identical arms (hard rule 14).")
         # `None` means "no curve", and a non-positive `soft` is REFUSED rather
         # than read as "off": `soft = 0` is a well-defined and catastrophic
         # setting -- a constant 0.5 field, every token half-edited, the mask
@@ -451,6 +482,8 @@ class GeoFixPairs(Dataset):
                 "(GeoFix hard rule 7).")
         if self.pooling == "max_arearef_rms":
             return self._mask_arearef(z, g)
+        if self.pooling == "max_sevref_obsk":
+            return self._mask_sevref_obsk(z, g)
         m = torch.cat([pool_mask(z[t], g, self.pooling) for t in self.mask_types],
                       dim=0)
         # Applied to the POOLED mask, matching how session 6.5 measured it.
@@ -483,6 +516,64 @@ class GeoFixPairs(Dataset):
             if self.gamma != 1.0:
                 m_rms = m_rms.clamp(min=0).pow(self.gamma)
             gam, exact = match_area_gamma(m_max, float(m_rms.mean()))
+            if not exact:
+                self.arearef_unmatched += 1
+            out.append(m_max.clamp(min=0).pow(gam))
+        return torch.cat(out, dim=0)
+
+    def _mask_sevref_obsk(self, z, g: int) -> torch.Tensor:
+        """MAX pooling rescaled per frame to the area `obs_K` rms-pooled gives.
+
+        THE STACKING DESIGN, IN ONE CHANNEL. Phase 1 measured that `obs_K` wins
+        frame-level SEVERITY 5x over `depth_disagree_disp` (r 0.659 vs 0.129) and
+        LOSES within-frame placement (rho 0.228 vs 0.382), so the plan was always
+        to stack them rather than swap. Stacking as two channels is blocked --
+        camera channel 0 is one channel and `prepare_data` raises on
+        `shape[2] != 1`, and the widening route needs `expand_state_dict` wired
+        into the trainer, which it is not.
+
+        This composes them instead. The placement plane is max-pooled and then
+        raised to the per-frame exponent that makes its mean equal `obs_K`'s.
+        `x ** g` is MONOTONE, so the token ranking out of here is the placement
+        plane's ranking EXACTLY -- nothing about localisation changes -- while the
+        frame's overall level is set by `obs_K`. Severity from one, placement from
+        the other.
+
+        WHY `obs_K` IS RMS-POOLED HERE AND NOT MAX. `obs_K` is a DENSE plane
+        (0.616 mean pixel area) and max pooling saturates it: 0.838 token area,
+        71.6% of tokens at >= 0.99, and 2 of 168 frames pooling to a literally
+        CONSTANT mask. A constant target area carries no severity signal at all,
+        which is what the max-pooled `obs_K` arm measured as a null. Under rms the
+        plane keeps its spread and its severity correlation is the better 0.663.
+        This is not a hard-rule-6 violation: that rule mandates MAX because a thin
+        floater mean-pooled washes out, an argument about a SPARSE bright mask,
+        and it inverts for a dense one. The PLACEMENT plane is still max-pooled,
+        which is what the rule is actually about.
+        """
+        if "obs_K" not in z.files:
+            raise KeyError(
+                "pooling='max_sevref_obsk' needs the `obs_K` plane in the mask "
+                f"file; it has {sorted(k for k in z.files if k != 'polarity')[:12]}. "
+                "Rebuild the pack with geofix.masks.add_observation_planes.")
+        if "obs_K" in self.mask_types:
+            raise ValueError(
+                "pooling='max_sevref_obsk' composes a PLACEMENT plane with "
+                "obs_K's severity; passing obs_K as the plane composes it with "
+                "itself, which is the arearef trick under another name.")
+        # SCALED, and the scale is not cosmetic. Unscaled, the composed area is
+        # obs_K's own 0.713 (training set), while the placement plane sits at
+        # 0.488 -- and this project measured the oracle's placement advantage
+        # PEAKING near area 0.45 and falling to nothing by 0.76 (CLAUDE.md, the
+        # low-area sweep). An arm at 0.713 would be tested where placement is
+        # worth least, and its result would be about area rather than severity.
+        # A LINEAR rescale leaves the Pearson severity correlation EXACTLY
+        # unchanged and leaves the ranking untouched, so it costs nothing the
+        # composition is for. Default 1.0 keeps the mode inert.
+        target = float(pool_mask(z["obs_K"], g, "rms").mean()) * self.sevref_scale
+        out = []
+        for t in self.mask_types:
+            m_max = pool_mask(z[t], g, "max")
+            gam, exact = match_area_gamma(m_max, target)
             if not exact:
                 self.arearef_unmatched += 1
             out.append(m_max.clamp(min=0).pow(gam))

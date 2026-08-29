@@ -1027,6 +1027,14 @@ def main(args):
         # was written to close, in a knob added after F3 landed.
         "contrast_soft": (None if _ds.get("contrast_soft") is None
                           else float(_ds["contrast_soft"])),
+        # ADDED 2026-08-29 IN THE SAME CHANGE THAT ADDS THE KNOB, which is what
+        # hard rule 14 asks for -- the provenance dict is not self-maintaining,
+        # and every previous entry here was added after a wrong number surfaced
+        # downstream. Read only by pooling='max_sevref_obsk', where it scales the
+        # per-frame target area taken from obs_K. Two arms differing only in this
+        # value are a real ablation (how much severity, at fixed placement) and
+        # would otherwise write byte-identical provenance.
+        "sevref_scale": float(_ds.get("sevref_scale", 1.0)),
     }
 
     if rank == 0:
@@ -1049,7 +1057,8 @@ def main(args):
         # checkpoint field, which is why it stays.
         logger.info(f"[GeoFix] mask_types={geofix_settings['mask_types']} "
                     f"pooling={geofix_settings['pooling']} "
-                    f"gamma={geofix_settings['gamma']}")
+                    f"gamma={geofix_settings['gamma']} "
+                    f"sevref_scale={geofix_settings['sevref_scale']}")
 
     rae = instantiate_from_config(rae_config).to(device)
 
