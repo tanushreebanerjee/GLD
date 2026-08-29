@@ -248,7 +248,26 @@ def diag_paths(rae, gt: torch.Tensor, cond: int) -> dict[str, float]:
     geofix_src = pathlib.Path(__file__).resolve().parents[2] / "geofix" / "src"
     if str(geofix_src) not in sys.path:
         sys.path.insert(0, str(geofix_src))
-    es = importlib.import_module("geofix.eval_stage1")
+    # `geofix.eval_stage1` MOVED to `geofix.experiments.eval_stage1` in the
+    # 2026-08-25 reorganisation (docs/MODULE_MAP.md). This call site was missed,
+    # and it only fires deep inside `diag_paths` -- AFTER the model is loaded and
+    # the first samples have already been written -- so the job burns several
+    # minutes of GPU and a plausible log before dying. Nothing re-ran
+    # pseudo_gt_geom between the refactor and 2026-08-29, which is why it sat
+    # broken for four days.
+    #
+    # Both names are tried, new one first, so the script works against a checkout
+    # from either side of the rename rather than pinning it to one.
+    for _name in ("geofix.experiments.eval_stage1", "geofix.eval_stage1"):
+        try:
+            es = importlib.import_module(_name)
+            break
+        except ModuleNotFoundError:
+            es = None
+    if es is None:
+        raise ModuleNotFoundError(
+            "eval_stage1 not found as geofix.experiments.eval_stage1 nor "
+            f"geofix.eval_stage1; looked under {geofix_src}")
     from utils.da3_validation_metric import apply_da3_norm
 
     out: dict[str, float] = {}
