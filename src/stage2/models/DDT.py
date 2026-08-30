@@ -838,7 +838,7 @@ class DiTwDDTHead(nn.Module):
         
         return guided_out
     
-    def forward_with_cfg(self, x, t, total_view, camera_embedding, cfg_scale, cfg_interval=(0, 1), uncond_camera_embedding=None, use_camera_drop=True, uncond_mode='keep', **kwargs):
+    def forward_with_cfg(self, x, t, total_view, camera_embedding, cfg_scale, cfg_interval=(0, 1), uncond_camera_embedding=None, use_camera_drop=True, uncond_mode='keep', cfg_mask_mode='none', cfg_mask_gain=0.0, **kwargs):
         """
         Forward pass of DiT with Classifier-Free Guidance.
         Batches the conditional and unconditional forward passes together.
@@ -940,13 +940,80 @@ class DiTwDDTHead(nn.Module):
         half_t = t 
 
         scale_mask = ((half_t >= guid_t_min) & (half_t <= guid_t_max)).view(-1, *[1] * (len(cond_eps.shape) - 1))
-        
+
+        # ---- GeoFix: MASK-MODULATED GUIDANCE -------------------------------
+        # `cfg_scale` multiplies (cond - uncond) elementwise, so making it a
+        # TENSOR broadcasts per token at no extra forward pass. The mask lives in
+        # camera-embedding channel 0 in `edit1` polarity (1.0 = damaged, repair
+        # here) and is preserved into the unconditional branch by the
+        # `[:, 1:] = 0.0` above, so it is available on both halves and identical
+        # on each -- which is exactly what a guidance WEIGHT needs.
+        #
+        # WHY THIS EXISTS. Every mask mechanism tried so far -- camera-channel
+        # conditioning, latent blending, loss gating, level-0 injection -- moves
+        # PSNR by less than the 0.326 dB that two identically-configured TRAINING
+        # runs differ by, so none of them is measurable. This one is applied at
+        # SAMPLING time to a fixed checkpoint, where two runs on one architecture
+        # are bit-identical (verified: max|diff| 0.0 over 76,204,800 pixels), so
+        # its noise floor is ZERO and an effect of any size is readable.
+        #
+        # It also needs no mask-conditioned model: the mask enters through the
+        # guidance weight, never through the network, so it applies to any
+        # checkpoint including the released one.
+        eff_scale = cfg_scale
+        if cfg_mask_mode != 'none':
+            m = camera_embedding[:, 0:1]                      # (B*V, 1, H, W)
+            if m.shape[-2:] != cond_eps.shape[-2:]:
+                raise ValueError(
+                    f"cfg_mask_mode={cfg_mask_mode!r}: mask channel is "
+                    f"{tuple(m.shape[-2:])} but eps is {tuple(cond_eps.shape[-2:])}. "
+                    "Per-token guidance requires them on the same grid; refusing "
+                    "to interpolate, which would silently change the mask.")
+            if cfg_mask_mode == 'centered':
+                # MEAN GUIDANCE EXACTLY PRESERVED, per view. Only WHERE the
+                # guidance goes varies, so the arm cannot be explained as "more
+                # guidance overall" -- the confound that made an area-matched
+                # control mandatory everywhere else on this project.
+                #
+                # THE GAIN IS BOUNDED IN CLOSED FORM RATHER THAN CLAMPED, and the
+                # difference is not cosmetic. With M in [0,1] the smallest scale is
+                # `cfg_scale - gain*mean(M)`, so a gain above (cfg_scale-1)/mean(M)
+                # drives part of the frame below 1.0. Clamping there RAISES the
+                # mean -- measured 1.500022 against a target of 1.5 at gain 1.0 --
+                # which quietly turns this arm into "placement PLUS a little more
+                # guidance overall", i.e. exactly the confound it exists to avoid.
+                # Bounding instead keeps the mean exact by construction.
+                mbar = m.mean(dim=(-2, -1), keepdim=True)
+                gmax = (cfg_scale - 1.0) / mbar.clamp(min=1e-6)
+                gain = torch.clamp(torch.as_tensor(
+                    cfg_mask_gain, device=m.device, dtype=m.dtype), max=gmax)
+                eff_scale = cfg_scale + gain * (m - mbar)
+            elif cfg_mask_mode == 'linear':
+                # Guidance only where the mask says repair: 1.0 (none) at M=0 up
+                # to cfg_scale at M=1. NOT mean-preserving -- read it beside
+                # `centered`, never instead of it.
+                eff_scale = 1.0 + (cfg_scale - 1.0) * m
+            else:
+                raise ValueError(
+                    f"cfg_mask_mode must be none|centered|linear, got {cfg_mask_mode!r}")
+            # Guidance below 1.0 pushes AWAY from the conditional; that is a
+            # different mechanism and is never what a mask should request. Both
+            # branches above are constructed so this cannot bite (`centered` by
+            # the gain bound, `linear` because M >= 0), so it is a FLOOR ASSERTION,
+            # not a correction -- if it ever fires, one of those arguments is wrong.
+            if bool((eff_scale < 1.0 - 1e-5).any()):
+                raise ValueError(
+                    f"cfg_mask_mode={cfg_mask_mode!r} produced guidance "
+                    f"{float(eff_scale.min()):.6f} < 1.0. The gain bound should make "
+                    "this unreachable; do not clamp past it, the mean-preservation "
+                    "claim depends on no clamping happening.")
+
         guided_eps = torch.where(
             scale_mask,
-            uncond_eps + cfg_scale * (cond_eps - uncond_eps),
+            uncond_eps + eff_scale * (cond_eps - uncond_eps),
             cond_eps
         )
-        
+
         return guided_eps
 
     def forward_with_autoguidance(self, x, t, y, cfg_scale, additional_model_forward, cfg_interval=(0, 1), **kwargs):

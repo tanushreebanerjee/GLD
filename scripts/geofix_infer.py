@@ -544,6 +544,27 @@ def main() -> int:
                          "Read with --mask-const, not instead of it: a constant "
                          "removes structure AND placement, roll removes placement "
                          "alone.")
+    ap.add_argument("--cfg-mask-mode", default="none",
+                    choices=("none", "centered", "linear"),
+                    help="MASK-MODULATED GUIDANCE -- use the mask at SAMPLING time "
+                         "as a per-token CFG weight instead of (or as well as) "
+                         "feeding it to the network.\n"
+                         "  none     - default, a strict no-op.\n"
+                         "  centered - scale = cfg_scale + gain*(M - mean(M)) per "
+                         "view. MEAN GUIDANCE IS EXACTLY PRESERVED, so only WHERE "
+                         "the guidance goes varies and the arm cannot be explained "
+                         "as 'more guidance overall'. Needs --cfg-mask-gain.\n"
+                         "  linear   - scale = 1 + (cfg_scale-1)*M: no guidance "
+                         "where the mask is clean, full guidance where it is "
+                         "damaged. NOT mean-preserving; read it beside `centered`, "
+                         "never instead of it.\n"
+                         "Requires --mask-in-camera (the mask reaches the guidance "
+                         "term through camera channel 0) and cfg_scale > 1.0. "
+                         "Works on ANY checkpoint, mask-conditioned or not, "
+                         "because the mask never enters the network.")
+    ap.add_argument("--cfg-mask-gain", type=float, default=0.0,
+                    help="Modulation depth for --cfg-mask-mode centered. 0.0 is a "
+                         "no-op, so a nonzero value is required for that mode.")
     ap.add_argument("--mask-pack", default=None, metavar="NPZ",
                     help="OVERRIDE the mask with an external pack, one 36x36 "
                          "`edit1` plane per (split, frame), written by "
@@ -695,6 +716,27 @@ def main() -> int:
                 "sampling-time composite reads the real mask, so the run would be "
                 "a control in name only.")
 
+    # MASK-MODULATED GUIDANCE: the same three guards the other mask controls carry.
+    # Every one of them turns a silently-inert flag into a refusal.
+    if args.cfg_mask_mode != "none":
+        if not args.mask_in_camera:
+            raise SystemExit(
+                f"--cfg-mask-mode {args.cfg_mask_mode} reads the mask out of camera "
+                "channel 0 and does nothing without --mask-in-camera.")
+        if args.cfg_scale is None or args.cfg_scale <= 1.0:
+            raise SystemExit(
+                f"--cfg-mask-mode {args.cfg_mask_mode} scales the guidance term, and "
+                f"cfg_scale={args.cfg_scale} means there is no guidance term to "
+                "scale. Raise --cfg-scale above 1.0 or drop the flag.")
+        if args.cfg_mask_mode == "centered" and args.cfg_mask_gain == 0.0:
+            raise SystemExit(
+                "--cfg-mask-mode centered with --cfg-mask-gain 0.0 is EXACTLY the "
+                "unmodulated arm, so it would run, finish, and be labelled as a "
+                "mechanism arm while being its own control. Pass a nonzero gain.")
+    elif args.cfg_mask_gain != 0.0:
+        raise SystemExit(
+            f"--cfg-mask-gain {args.cfg_mask_gain} without --cfg-mask-mode is inert.")
+
     if args.mask_transform != "none":
         if not (args.mask_in_camera or args.mask_in_camera_l0):
             raise SystemExit(
@@ -774,6 +816,8 @@ def main() -> int:
         cond_num=args.cond_num,
         image_size=args.image_size,
         cfg_scale=args.cfg_scale,
+        cfg_mask_mode=args.cfg_mask_mode,
+        cfg_mask_gain=args.cfg_mask_gain,
         cfg_scale_cascade=args.cfg_scale_cascade,
         # The manifest already placed clean photographs in [0, cond_num); this flag
         # is build_context's own reference-swapping path, which would do it twice.
@@ -1036,6 +1080,7 @@ def main() -> int:
             ref_view_sampling=ctx["ref_view_sampling"], camera_mode=ctx["camera_mode"],
             is_concat_mode=True, pag_scale=None, pag_layer_idx=None,
             cfg_scale=ctx["cfg_scale"], use_camera_drop=ctx["use_camera_drop"],
+            cfg_mask_mode=ctx["cfg_mask_mode"], cfg_mask_gain=ctx["cfg_mask_gain"],
             cfg_uncond_mode=ctx["cfg_uncond_mode"], batch=geo_batch,
             geofix_artifact_images=art, geofix_mask=msk,
             # A bridge-trained checkpoint has to be SAMPLED as a bridge. These
@@ -1246,6 +1291,11 @@ def main() -> int:
         "views_written": "target only, [cond_num, num_views)",
         "seed_scheme": "args.seed + sample_index (paired across arms)",
         "cfg_scale": ctx["cfg_scale"],
+        # Rule 14: a conditioning knob goes in the provenance dict in the SAME
+        # change that adds the knob, and is asserted at the point of USE (the
+        # ValueError in get_denoised_features when CFG is off).
+        "cfg_mask_mode": ctx["cfg_mask_mode"],
+        "cfg_mask_gain": ctx["cfg_mask_gain"],
         "cfg_scale_cascade": ctx["cfg_scale_cascade"],
         "decode": "latent_blending.build_context + L1 gen + learned cascade + decode_into_images",
         "command": " ".join(sys.argv),

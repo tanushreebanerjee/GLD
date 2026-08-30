@@ -122,6 +122,11 @@ def get_denoised_features(
     pag_scale=None,
     pag_layer_idx=None,
     cfg_scale=None,
+    # GeoFix: MASK-MODULATED GUIDANCE. 'none' is a strict no-op, so every arm
+    # queued before this existed reproduces bit-identically. See
+    # DDT.forward_with_cfg for what the two modes do and why.
+    cfg_mask_mode='none',
+    cfg_mask_gain=0.0,
     use_camera_drop=True,  # NEW
     cfg_uncond_mode='keep',  # NEW
     batch=None,
@@ -339,6 +344,17 @@ def get_denoised_features(
         model_kwargs['cfg_scale'] = cfg_scale
         model_kwargs['use_camera_drop'] = use_camera_drop  # NEW
         model_kwargs['uncond_mode'] = cfg_uncond_mode  # NEW
+        if cfg_mask_mode != 'none':
+            model_kwargs['cfg_mask_mode'] = cfg_mask_mode
+            model_kwargs['cfg_mask_gain'] = cfg_mask_gain
+    elif cfg_mask_mode != 'none':
+        # `forward_with_cfg` is only reached when cfg_scale > 1.0, so a mask mode
+        # set without guidance would be SILENTLY INERT -- the "recorded is not
+        # wired" failure this project has now hit six times (CLAUDE.md rule 14).
+        raise ValueError(
+            f"cfg_mask_mode={cfg_mask_mode!r} needs cfg_scale > 1.0, got {cfg_scale}. "
+            "Mask-modulated guidance scales the guidance term, and with CFG off "
+            "there is no guidance term to scale.")
     
     # Concat mode handling
     if is_concat_mode:
