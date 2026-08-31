@@ -281,10 +281,10 @@ dataset:
   name: geofix
 
   # Absolute: training runs from the GLD fork worktree, not from geofix/.
-  manifest: /fs/nexus-projects/Generative_Detection/workspace/research/uncertainty-guided-diffusion/geofix/eval/train/manifest_masked_exclude.json
+  manifest: /fs/nexus-projects/Generative_Detection/workspace/research/uncertainty-guided-diffusion/geofix/eval/train/manifest_masked_exclude_l2.json
   # The frozen holdout, it_03000 only. Shares 0 splits AND 0 (level, scene, run)
   # reconstructions with the training manifest.
-  val_manifest: /fs/nexus-projects/Generative_Detection/workspace/research/uncertainty-guided-diffusion/geofix/eval/train/manifest_holdout_it03000.json
+  val_manifest: /fs/nexus-projects/Generative_Detection/workspace/research/uncertainty-guided-diffusion/geofix/eval/train/manifest_holdout_it03000_l2.json
 
   # Mask planes stacked in order; must match what the manifest recorded.
   mask_types: [oracle_l2]
