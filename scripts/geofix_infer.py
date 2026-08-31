@@ -723,11 +723,6 @@ def main() -> int:
             raise SystemExit(
                 f"--cfg-mask-mode {args.cfg_mask_mode} reads the mask out of camera "
                 "channel 0 and does nothing without --mask-in-camera.")
-        if args.cfg_scale is None or args.cfg_scale <= 1.0:
-            raise SystemExit(
-                f"--cfg-mask-mode {args.cfg_mask_mode} scales the guidance term, and "
-                f"cfg_scale={args.cfg_scale} means there is no guidance term to "
-                "scale. Raise --cfg-scale above 1.0 or drop the flag.")
         if args.cfg_mask_mode == "centered" and args.cfg_mask_gain == 0.0:
             raise SystemExit(
                 "--cfg-mask-mode centered with --cfg-mask-gain 0.0 is EXACTLY the "
@@ -823,6 +818,20 @@ def main() -> int:
         # is build_context's own reference-swapping path, which would do it twice.
         clean_refs=None,
     ), device)
+
+    # The cfg_scale that matters is the EFFECTIVE one: `--cfg-scale` falls back to
+    # the eval config's `guidance.scale`, so checking `args.cfg_scale` at parse time
+    # refuses a perfectly good run (it did, job 7381913). Check it here, where the
+    # resolved value exists, and still before any sample is loaded.
+    if ctx["cfg_mask_mode"] != "none":
+        _cs = ctx["cfg_scale"]
+        if _cs is None or _cs <= 1.0:
+            raise SystemExit(
+                f"--cfg-mask-mode {ctx['cfg_mask_mode']} scales the guidance term, "
+                f"and the effective cfg_scale is {_cs} -- there is no guidance term "
+                "to scale. Raise --cfg-scale, or the eval config's guidance.scale.")
+        print(f"[cfg-mask] mode={ctx['cfg_mask_mode']} gain={ctx['cfg_mask_gain']} "
+              f"on cfg_scale={_cs}", flush=True)
 
     v, cond = ctx["num_views"], ctx["cond_num"]
     # Fail before loading 194 samples if the protocol disagrees. `assert_view_config`

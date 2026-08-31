@@ -866,6 +866,12 @@ def build_context(args, device) -> dict:
         "camera_mode": model_cfg.get("dataset", {}).get("camera_mode", "plucker"),
         "ref_view_sampling": sampling_cfg.get("ref_view_sampling", "prefix"),
         "cfg_scale": cfg_scale,
+        # GeoFix mask-modulated guidance. `getattr` because build_context is also
+        # called from latent_blending's own main() and from the masknet drivers,
+        # whose argument namespaces predate these two fields; the default is the
+        # strict no-op, so those callers are unaffected.
+        "cfg_mask_mode": getattr(args, "cfg_mask_mode", "none"),
+        "cfg_mask_gain": float(getattr(args, "cfg_mask_gain", 0.0)),
         "cfg_scale_cascade": cfg_cascade,
         "use_camera_drop": bool(guidance.get("use_camera_drop", True)),
         "cfg_uncond_mode": guidance.get("cfg_l1_uncond_mode", "keep"),

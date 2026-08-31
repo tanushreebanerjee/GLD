@@ -962,13 +962,33 @@ class DiTwDDTHead(nn.Module):
         # checkpoint including the released one.
         eff_scale = cfg_scale
         if cfg_mask_mode != 'none':
-            m = camera_embedding[:, 0:1]                      # (B*V, 1, H, W)
+            m = camera_embedding[:, 0:1]                      # (B*V, 1, 504, 504)
             if m.shape[-2:] != cond_eps.shape[-2:]:
-                raise ValueError(
-                    f"cfg_mask_mode={cfg_mask_mode!r}: mask channel is "
-                    f"{tuple(m.shape[-2:])} but eps is {tuple(cond_eps.shape[-2:])}. "
-                    "Per-token guidance requires them on the same grid; refusing "
-                    "to interpolate, which would silently change the mask.")
+                # The camera embedding is at IMAGE resolution and eps is on the
+                # 36x36 token grid (the patch embedding happens inside the model),
+                # so the mask has to come down to the token grid before it can
+                # weight anything.
+                #
+                # WHICH POOLING IS NOT A PREFERENCE HERE. The mask written into
+                # channel 0 was already pooled to 36x36 by the dataloader and
+                # then upsampled, so it is piecewise-constant on 14x14 blocks and
+                # EVERY pooling agrees. That is checked, not assumed: if max and
+                # mean disagree the map is not blocky, the recovery is lossy, and
+                # hard rule 6 (MAX for a sparse mask, but check the pooled area
+                # for a dense one) would have to be decided deliberately rather
+                # than inherited from this line.
+                mx = F.adaptive_max_pool2d(m, cond_eps.shape[-2:])
+                mn = F.adaptive_avg_pool2d(m, cond_eps.shape[-2:])
+                gap = float((mx - mn).abs().max())
+                if gap > 1e-4:
+                    raise ValueError(
+                        f"cfg_mask_mode={cfg_mask_mode!r}: pooling the mask from "
+                        f"{tuple(m.shape[-2:])} to {tuple(cond_eps.shape[-2:])} is "
+                        f"LOSSY (max-pool and mean-pool differ by {gap:.4f}), so the "
+                        "map in camera channel 0 is not piecewise-constant on the "
+                        "token grid. Decide the pooling deliberately under hard "
+                        "rule 6 instead of letting this line pick one.")
+                m = mx
             if cfg_mask_mode == 'centered':
                 # MEAN GUIDANCE EXACTLY PRESERVED, per view. Only WHERE the
                 # guidance goes varies, so the arm cannot be explained as "more
