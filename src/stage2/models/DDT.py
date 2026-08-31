@@ -838,7 +838,7 @@ class DiTwDDTHead(nn.Module):
         
         return guided_out
     
-    def forward_with_cfg(self, x, t, total_view, camera_embedding, cfg_scale, cfg_interval=(0, 1), uncond_camera_embedding=None, use_camera_drop=True, uncond_mode='keep', cfg_mask_mode='none', cfg_mask_gain=0.0, **kwargs):
+    def forward_with_cfg(self, x, t, total_view, camera_embedding, cfg_scale, cfg_interval=(0, 1), uncond_camera_embedding=None, use_camera_drop=True, uncond_mode='keep', cfg_mask_mode='none', cfg_mask_gain=0.0, cfg_mask_plane=None, **kwargs):
         """
         Forward pass of DiT with Classifier-Free Guidance.
         Batches the conditional and unconditional forward passes together.
@@ -962,7 +962,21 @@ class DiTwDDTHead(nn.Module):
         # checkpoint including the released one.
         eff_scale = cfg_scale
         if cfg_mask_mode != 'none':
-            m = camera_embedding[:, 0:1]                      # (B*V, 1, 504, 504)
+            # THE PLANE COMES IN SEPARATELY, never from camera_embedding[:, 0].
+            # Channel 0 is a NETWORK INPUT: reading the guidance weight out of it
+            # forces `--mask-in-camera`, which on a model not trained with it is a
+            # train/test mismatch. That is exactly what happened on 2026-08-31 --
+            # all three arms lost 4.5-5.3 dB, INCLUDING the constant control, which
+            # under mean-preserving `centered` is provably a bit-identical no-op.
+            # A control that cannot move and moved is the cleanest possible signal
+            # that the mechanism was wired wrong rather than that the mask is useless.
+            if cfg_mask_plane is None:
+                raise ValueError(
+                    f"cfg_mask_mode={cfg_mask_mode!r} needs cfg_mask_plane. Refusing "
+                    "to fall back to camera channel 0 -- that couples the guidance "
+                    "weight to a network input and silently requires --mask-in-camera.")
+            m = cfg_mask_plane.to(dtype=cond_eps.dtype)
+            m = torch.cat([m, m], dim=0) if m.shape[0] == half_n else m
             if m.shape[-2:] != cond_eps.shape[-2:]:
                 # The camera embedding is at IMAGE resolution and eps is on the
                 # 36x36 token grid (the patch embedding happens inside the model),

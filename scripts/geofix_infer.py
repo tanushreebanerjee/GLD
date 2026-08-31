@@ -719,10 +719,15 @@ def main() -> int:
     # MASK-MODULATED GUIDANCE: the same three guards the other mask controls carry.
     # Every one of them turns a silently-inert flag into a refusal.
     if args.cfg_mask_mode != "none":
-        if not args.mask_in_camera:
-            raise SystemExit(
-                f"--cfg-mask-mode {args.cfg_mask_mode} reads the mask out of camera "
-                "channel 0 and does nothing without --mask-in-camera.")
+        # DELIBERATELY NOT requiring --mask-in-camera. Requiring it is what broke the
+        # first run: it forces the mask into a network input, so on a checkpoint not
+        # trained with it every arm is a train/test mismatch. The guidance weight now
+        # gets its own copy of the mask and the network's input is untouched.
+        if args.mask_in_camera:
+            print("[cfg-mask] NOTE --mask-in-camera is also on, so the mask is BOTH a "
+                  "network input and a guidance weight. That is a valid arm only on a "
+                  "checkpoint trained with mask_in_camera; the parity gate checks it.",
+                  flush=True)
         if args.cfg_mask_mode == "centered" and args.cfg_mask_gain == 0.0:
             raise SystemExit(
                 "--cfg-mask-mode centered with --cfg-mask-gain 0.0 is EXACTLY the "
@@ -1048,7 +1053,14 @@ def main() -> int:
                       flush=True)
 
         # Route AFTER the controls, so both levels see the same tensor the arm's
-        # name describes.
+        # name describes. `msk_any` is also what the GUIDANCE weight uses -- taken
+        # here, after --mask-const / --mask-transform, so the controls apply to the
+        # guidance mechanism exactly as they do to the conditioning one.
+        if args.cfg_mask_mode != "none" and msk_any is None:
+            raise SystemExit(
+                f"--cfg-mask-mode {args.cfg_mask_mode} but this sample carries no mask. "
+                "The guidance weight is built from the mask; without one the arm would "
+                "run as an unmodulated no-op wearing a mechanism's name.")
         msk = msk_any if args.mask_in_camera else None
         msk_l0 = msk_any if args.mask_in_camera_l0 else None
 
@@ -1090,6 +1102,10 @@ def main() -> int:
             is_concat_mode=True, pag_scale=None, pag_layer_idx=None,
             cfg_scale=ctx["cfg_scale"], use_camera_drop=ctx["use_camera_drop"],
             cfg_mask_mode=ctx["cfg_mask_mode"], cfg_mask_gain=ctx["cfg_mask_gain"],
+            # SEPARATE from `geofix_mask`: this copy only weights the guidance term
+            # and never reaches the network, so the mechanism does not require
+            # --mask-in-camera and cannot create a train/test mismatch.
+            cfg_mask_plane=(msk_any if ctx["cfg_mask_mode"] != "none" else None),
             cfg_uncond_mode=ctx["cfg_uncond_mode"], batch=geo_batch,
             geofix_artifact_images=art, geofix_mask=msk,
             # A bridge-trained checkpoint has to be SAMPLED as a bridge. These

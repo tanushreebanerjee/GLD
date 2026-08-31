@@ -127,6 +127,13 @@ def get_denoised_features(
     # DDT.forward_with_cfg for what the two modes do and why.
     cfg_mask_mode='none',
     cfg_mask_gain=0.0,
+    # The plane the GUIDANCE weight is built from, kept separate from `geofix_mask`
+    # (which is graded into camera channel 0 and so is an input the NETWORK sees).
+    # Routing the two together is what invalidated the 2026-08-31 first run: the
+    # mask reached the guidance term only by also being written into channel 0 of a
+    # model trained without it, so every arm -- including the constant control that
+    # is provably a no-op -- lost 4.5 dB to a train/test mismatch.
+    cfg_mask_plane=None,   # (B, V, 1, g, g) on the token grid, same as geofix_mask
     use_camera_drop=True,  # NEW
     cfg_uncond_mode='keep',  # NEW
     batch=None,
@@ -345,8 +352,15 @@ def get_denoised_features(
         model_kwargs['use_camera_drop'] = use_camera_drop  # NEW
         model_kwargs['uncond_mode'] = cfg_uncond_mode  # NEW
         if cfg_mask_mode != 'none':
+            if cfg_mask_plane is None:
+                raise ValueError(
+                    "cfg_mask_mode is set but cfg_mask_plane is None. The guidance "
+                    "weight needs its own copy of the mask; it must NOT be taken "
+                    "from camera channel 0, which is a network input.")
             model_kwargs['cfg_mask_mode'] = cfg_mask_mode
             model_kwargs['cfg_mask_gain'] = cfg_mask_gain
+            _p = cfg_mask_plane.to(device)
+            model_kwargs['cfg_mask_plane'] = _p.reshape(B * V, 1, *_p.shape[-2:])
     elif cfg_mask_mode != 'none':
         # `forward_with_cfg` is only reached when cfg_scale > 1.0, so a mask mode
         # set without guidance would be SILENTLY INERT -- the "recorded is not
