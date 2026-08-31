@@ -1,0 +1,471 @@
+# THE LEVEL-0 CASCADE ON THE L2 PLANE -- removing the plane confound from TODO 6.
+#
+# The level-0 negative (-0.0263 LPIPS at 0/14, hf 0.528 -> 0.324) was measured with
+# `oracle_lpips`, which the 2026-08-31 plane audit found is the WEAKEST conditioning
+# plane in the project (+0.045 dB, t 1.90, 9/14, not significant). Only three arms
+# have ever used `oracle_l2`, and all three are the top-3 mask arms.
+#
+# I expect this to reproduce the negative: the gamma sweep moved hf_ratio by 0.004
+# across a 6x range, so the cascade's blur looks like a response to being conditioned
+# at level 0 AT ALL rather than to which tokens the mask marks. Running it anyway is
+# the difference between "likely plane-independent" and "measured".
+# GeoFix -- finetune the released LEVEL-0 CASCADE so the two conditioning slots
+# work at level 0 as well as at level 1.
+#
+# Derived from DA3_cascade.yaml (the released cascade config, byte-identical in
+# `third_party/gld/` and in this worktree) plus the `geofix:` block from
+# DA3_geofix_level1.yaml. Everything not commented below is unchanged from
+# DA3_cascade.yaml on purpose: this is a FINETUNE of a converged checkpoint, and
+# a silently different architecture or transport would make the result
+# incomparable to the released model and to every session-8 number that ran
+# through it.
+#
+#   torchrun --standalone --nnodes=1 --nproc_per_node=1 src/train_multiview_da3.py \
+#     --config configs/training/DA3_geofix_cascade.yaml \
+#     --data-path assets --results-dir results/geofix/cascade \
+#     --precision bf16 \
+#     --pretrained <geofix>/third_party/gld/checkpoints/da3_cascade.pt
+#
+# `--pretrained` (weights only), NOT `--ckpt` (weights + optimizer + step): a new
+# run from a released checkpoint, not a resume of theirs. Hard rule 2 forbids
+# stage-2 training FROM SCRATCH; finetuning from the release is the plan.
+#
+# =============================================================================
+# WHY THIS FILE EXISTS AT ALL -- and what it is NOT
+# =============================================================================
+#
+# GLD's "levels" are DA3 BLOCK DEPTHS, not resolutions. Level 0 is block 5,
+# level 1 is block 7, and BOTH are (B*V, 1536, 36, 36). Conditioning at level 0
+# buys NO spatial resolution whatsoever -- only semantic depth. (The header
+# comment of DA3_level1.yaml claiming 518 / 37x37 is stale; its own params say
+# 504.) Anyone writing this up must not describe level 0 as "higher resolution".
+#
+# This is NOT contradicted by CLAUDE.md's "do not blend at both levels". That
+# rule -- +0.100 dB for `oracle_bin`, -0.268 dB for `oracle_abs` when
+# compositing at level 0 on top of level 1 -- is about BLENDING, i.e. mixing
+# latents into x_t during sampling, where the cascade already propagates the
+# level-1 composite and a second composite applies the same operation twice.
+# CONDITIONING is a different mechanism: the network READS the slot instead of
+# being averaged with it, and nothing is applied twice. `docs/ARCH_NOTES.md`
+# records the opposite prediction as an intended contribution. **No level-0
+# CONDITIONING result exists in RESULTS.md, for either sign** -- do not quote
+# the blending numbers as a forecast for this run.
+#
+# =============================================================================
+# THE LOAD-BEARING CAVEAT: `da3_cascade.pt` HAS NEVER SEEN EITHER INPUT
+# =============================================================================
+#
+# The released cascade trained with `cond_channel[:, cond_num:]` all ZEROS and
+# with camera channel 0 a strict {0, 1} that was also spatially CONSTANT WITHIN
+# EACH VIEW. Switching the inference flags (`geofix_infer.py
+# --cond-artifact-l0 --mask-in-camera-l0`) on against that checkpoint does not
+# add a conditioning signal -- it hands a converged model an off-distribution
+# input at a point where nothing can adapt. **This config is the finetune those
+# flags are waiting for.** A null measured on the released cascade with the
+# flags on is a measurement of the distribution shift, not a negative result
+# about level-0 conditioning, and hard rule 8 makes the difference reportable.
+#
+# How large a shift to expect, from the one measurement we have: the identical
+# two slots at LEVEL 1 produced gradient norms of 269.5 (mean over steps 0-9,
+# 10/10 above the clip threshold), 212.9 (10-19), 128.1 (30-39), and did not
+# fall below 10 until roughly step 70 -- the full table is in
+# `gld-session8-eval/src/utils/geofix_slots.py`. Train loss 1.72 against slot
+# 1's 0.44 at step 20, converging to 0.3413 against 0.3184 by step 130. That is
+# why `training.scheduler.warmup_steps` below is 100 and is load-bearing rather
+# than cosmetic, and it is why the early gradient-norm log must not be read as
+# divergence: norms are only logged above `clip_grad * 10`, so the warning GOING
+# QUIET is the pass signal.
+#
+# =============================================================================
+# VERIFIED, NOT ASSUMED: the training side needs NO code change
+# =============================================================================
+#
+# The claim was checked against `gld-session7/src/train_multiview_da3.py` rather
+# than assumed, because a config that silently trains the wrong thing is this
+# project's most expensive failure mode. Four links, each read in the source:
+#
+#   1. `prepare_data` (line ~80) takes `artifact_images` and `geofix_mask` and
+#      is LEVEL-AGNOSTIC. It encodes the render with `rae.encode(art_norm)` --
+#      no explicit level -- and grades camera channel 0 by the mask regardless
+#      of which level is being trained.
+#   2. `rae.level` is set from the STAGE-2 config: line ~951,
+#      `rae_config.params.level = model_config.params.level`. With
+#      `stage_2.params.level: 0` below, `prepare_data`'s encodes run at level 0,
+#      under `stage_1.normalization_stat_path` (the level-0 file). Level 0 and
+#      level 1 have DIFFERENT channel statistics; this link is what keeps the
+#      render's features in the same space as the reference features that sit
+#      beside them in the same tensor.
+#   3. The whole `geofix:` block is parsed in `main` (line ~568) with no level
+#      condition anywhere in it.
+#   4. The `gt_inp` -> `gt_clean` role swap and the `batch['mask']` lookup
+#      (line ~1400) are equally level-free.
+#
+# The one thing that IS level-specific is the checkpoint/architecture pairing,
+# and it was measured rather than reasoned about. `train_multiview_da3.py`
+# instantiates the config's `target` directly (`stage2.models.DDT.DiTwDDTHead`)
+# while `eval_gld_metric.py` rewrites the target to `stage2.models.DDT_old`
+# whenever `architecture_mode == "old"`. Those are different files, so loading
+# the released cascade into the training-side class was checked on a meta
+# device:
+#
+#     model state_dict keys           386
+#     da3_cascade.pt['ema'] keys      378
+#     missing                           8   (all *_ref / *_tgt embedder proj)
+#     unexpected                        0
+#     named_parameters (deduped)      378
+#
+# The 8 "missing" keys are NOT missing weights. In `architecture_mode: "old"`,
+# DDT.py line ~294 ALIASES `s_embedder_ref = s_embedder_tgt = s_embedder` (and
+# likewise for x), so `state_dict()` lists the same four tensors twice while
+# `named_parameters()` dedups to 378. Every trainable tensor is loaded from the
+# checkpoint. `--pretrained`'s guard trips at >20 missing, so 8 passes -- and
+# that guard is the only thing standing between a finetune and a from-scratch
+# run wearing a finetune's name, so it is worth knowing exactly why it passes.
+#
+# =============================================================================
+# AN ASYMMETRY INHERITED FROM THE RELEASE -- flagged, NOT fixed here
+# =============================================================================
+#
+# `training.source_level: 1` below means x0 is the LEVEL-1 features (plus noise)
+# rather than N(0, I): a feature-to-feature flow. But `geofix_infer.py` samples
+# the cascade through `get_cascade_features(eval_mode="cascade")`, which starts
+# from PURE NOISE and instead passes the level-1 features as
+# `model_kwargs['source_condition']` (consumed by the `l1_as_cond` branch in
+# DDT_old.py line ~535). Training writes the L1 features into x0; inference
+# writes them into the encoder input. Those are not the same thing.
+#
+# This asymmetry is the RELEASE's, not ours: the released repo's own
+# `run_train.sh da3 cascade` uses this exact config and its `eval_gld.sh da3
+# cascade` uses that exact eval mode. A charitable reading is that the two agree
+# at t=1 (where x_t is essentially the L1 features) and that `source_condition`
+# simply pins that input for all t. It is left EXACTLY as released because a
+# finetune that changes the transport is not comparable to the checkpoint it
+# starts from -- but it should be settled before any cascade number is quoted,
+# and the honest statement today is that it is unsettled.
+#
+# A second, smaller asymmetry that IS ours: with `clean_target: true` the
+# trainer swaps `image` to `gt_clean` BEFORE the `source_level` encode (line
+# ~1757 reads `image`), so x0 is the level-1 features of the CLEAN photograph,
+# while at inference the cascade receives the level-1 model's GENERATED
+# features. That direction is the right one -- generated features are meant to
+# approximate clean ones, and encoding the RENDER there would train the cascade
+# to expect damage the level-1 stage was just asked to remove -- but it is a
+# choice, and it is written down here so it is not rediscovered as a surprise.
+# =============================================================================
+
+stage_1:
+  target: stage1.rae_da3.RAE_DA3
+  params:
+    encoder_pretrained_path: 'depth-anything/DA3-Base'
+    encoder_input_size: 504
+    encoder_type: 'DA3EncoderDirect'
+    decoder_config_path: 'configs/decoder/ViTXL'
+    da3_weights_path: 'pretrained_models/da3/model.safetensors'
+    noise_tau: 0.0
+    reshape_to_2d: true
+    # HARD RULE 5, level-0 file. The released `model_stats/da3/
+    # normalization_stats_level0.pt` is derived from CLEAN RE10K imagery; the
+    # 2026-08-16 decomposition (RESULTS.md) puts the DATASET term at |z|mean
+    # 0.159 at L0 against 0.150 for artifacts and 0.014 for resolution, so the
+    # released file is wrong for us on dataset grounds alone, before artifacts
+    # are considered.
+    #
+    # NOTE this is the SAME leg directory the level-1 GeoFix config uses, just
+    # its level-0 member. That is required, not merely tidy: the cascade is
+    # finetuned to consume what the finetuned level-1 model emits, and two legs
+    # would put the two stages in different spaces.
+    normalization_stat_path: '/fs/nexus-projects/Generative_Detection/workspace/research/uncertainty-guided-diffusion/geofix/eval/feature_stats/legs/dl3dv_art_504__imagenet/normalization_stats_level0.pt'
+    # PRESENT, and it was deliberately absent until the smoke test failed.
+    #
+    # The original reasoning was that `DA3_cascade.yaml` omits `mae_weight`, so
+    # following the cascade config meant omitting it too, and adding it would be
+    # an un-forced difference from the checkpoint being finetuned. The reasoning
+    # was right about provenance and wrong about consequence: smoke job 7363244
+    # died in the step-1 validation with
+    #
+    #   rae_da3.py:503  RuntimeError: 'rgb' is not a tensor: <class 'NoneType'>
+    #
+    # `decode` gets RGB from one of two places (`rae_da3.py:451-497`): the DPT
+    # head, or the MAE decoder which OVERWRITES it. DA3's DPT head is depth-only
+    # here, so it returns `rgb=None`, and with no MAE decoder nothing ever fills
+    # it in. Validation cannot render an image at all.
+    #
+    # Adding it is not a difference from the finetuned checkpoint. `mae_weight`
+    # loads a FROZEN STAGE-1 DECODER used only to turn validation latents into
+    # pictures; it is not trained, and no stage-2 tensor depends on it. It is
+    # also what `DA3_geofix_level1.yaml` already uses, so the two cascade stages
+    # decode through the same head -- which is the same "one leg, both stages"
+    # argument the normalisation comment above makes.
+    mae_weight: './pretrained_models/mae_decoder.pt'
+
+stage_2:
+  # Left as `DDT.DiTwDDTHead` with `architecture_mode: "old"`, exactly as
+  # released. The trainer instantiates this target directly; the EVAL path
+  # rewrites it to `stage2.models.DDT_old.DiTwDDTHead` when it sees
+  # `architecture_mode: "old"` (eval_gld_metric.py `instantiate_model`). See the
+  # measured key comparison in the header -- the two agree on all 378 trainable
+  # tensors and differ only in eight aliases.
+  target: stage2.models.DDT.DiTwDDTHead
+  params:
+    patch_size: 1
+    in_channels: 1536
+    hidden_size: [768, 2048]
+    # 2, not the level-1 model's 6. The cascade head is deliberately small.
+    depth: [28, 2]
+    num_heads: [16, 16]
+    mlp_ratio: 4.0
+    use_qknorm: false
+    use_swiglu: true
+    use_rope: false
+    use_rmsnorm: true
+    wo_shift: false
+    use_pos_embed: false
+    use_prope: true
+    architecture_mode: "old"
+    cfg_mode: "old"
+    level: 0
+    predict_cls: false
+    is_concat_mode: true
+    # KEY PARAMETER: condition on level-1 features. Only consumed when the caller
+    # passes `source_condition` -- see the asymmetry note in the header.
+    source_condition_mode: l1_as_cond
+    cam_input_size: 504
+    cam_patch_size: 14
+
+# =============================================================================
+# GeoFix conditioning at LEVEL 0 -- the same two slots, one level down.
+#
+# Neither needs the `2C -> 2C + n_mask` embedder widening, so a level-0 result
+# cannot be confounded with "my channel surgery perturbed a released
+# checkpoint" any more than the level-1 result could.
+#
+#   cond_artifact=F mask_in_camera=F   released cascade, unchanged
+#   cond_artifact=T mask_in_camera=F   render conditioning WITHOUT the mask;
+#                                      the honest baseline for "does the mask
+#                                      add anything at level 0"
+#   cond_artifact=T mask_in_camera=T   GeoFix at level 0            <- this file
+#   cond_artifact=F mask_in_camera=T   mask with nothing to preserve; a
+#                                      diagnostic, never a deployed arm
+#
+# Run at least the middle two. The level-1 experience is unambiguous that the
+# mask's contribution is SMALL next to the render's (+0.061 dB from an ORACLE
+# mask at step 33000, against the ~2.3 dB render conditioning alone buys), and a
+# single combined arm cannot separate them.
+# =============================================================================
+geofix:
+  # Fill `cond_channel[:, cond_num:]` -- which the released cascade leaves as
+  # ZEROS -- with the render's LEVEL-0 features. `prepare_data` encodes them at
+  # `rae.level`, which link 2 in the header pins to 0 for this config, so they
+  # land in the same normalised space as the reference features beside them.
+  cond_artifact: true
+
+  # Grade camera-embedding channel 0 by M_edit on the target half instead of the
+  # constant 1.0 it carries today. Polarity already agrees -- channel 0 = 1 means
+  # "target, generate it", M_edit = 1 means "repair here" -- so this is the one
+  # mask in the project that enters with NO sign flip, and hard rule 7 is
+  # satisfied by construction rather than by a correction. A defensive flip added
+  # "to be safe" would be the bug. CFG preserves it: the uncond branch zeroes
+  # camera channels 1: and keeps 0.
+  mask_in_camera: true
+
+  # Explicit rather than null. The historical default (on iff cond_artifact or
+  # bridge_x0 is on) would resolve to exactly this value, but the failure it
+  # guards against is severe enough to be worth stating: `gt_inp` from the
+  # GeoFix loader is the ARTIFACT RENDER and `gt_clean` is the clean photograph,
+  # so with this off the model is supervised to REPRODUCE 3DGS artifacts -- and
+  # such a model scores exactly as well as the render on every metric, which is
+  # how two session-8 runs (7292471/7292472) trained that way without anyone
+  # noticing.
+  clean_target: true
+
+  # The bridge is OFF, and at level 0 it is not merely unused but INCOMPATIBLE:
+  # `train_multiview_da3.py` raises when `bridge_x0` and `training.source_level`
+  # are both set, because both write the x0 end of the flow, and the cascade
+  # needs `source_level: 1`. Left here at the level-1 config's values so the two
+  # files diff cleanly, not because either is reachable from this one.
+  bridge_x0: null
+  bridge_noise_tau: 0.1
+  bridge_mask_noise: false
+
+  # Training-time latent blending, off. The blend line is CLOSED (CLAUDE.md,
+  # 2026-08-16) and this config is about conditioning.
+  blend_train: false
+
+transport:
+  params:
+    path_type: 'Linear'
+    prediction: 'velocity'
+    loss_weight: null
+    time_dist_type: 'uniform'
+
+sampler:
+  mode: ODE
+  params:
+    sampling_method: 'euler'
+    num_steps: 50
+    atol: 1.0e-6
+    rtol: 1.0e-3
+    reverse: false
+
+training:
+  camera_drop: 0.1
+  global_seed: 0
+  epochs: 1000000
+  # `global_batch_size` is the total ACROSS accumulation and is floor-divided:
+  # micro_batch = global_batch_size // (world_size * grad_accum_steps), so
+  # 4 // (1 * 4) = 1 sample of 8 views per forward at 504x504, accumulated 4x.
+  # Setting it to 1 yields micro_batch 0 and a DataLoader crash. The released
+  # cascade used 16 across 8xB200; one A6000 (48G) has nothing like that
+  # headroom, so the depth comes from accumulation. Same values as the level-1
+  # GeoFix config, and the cascade head is SMALLER (depth [28, 2] against
+  # [28, 6]), so if anything there is slack here -- raise it only after a real
+  # memory measurement, not on this comment.
+  global_batch_size: 4
+  grad_accum_steps: 4
+  ema_decay: 0.9995
+  num_workers: 4
+  log_every: 10
+  # 5e-5 is the released FROM-SCRATCH rate. This is a finetune of a converged
+  # checkpoint on 269 samples, where that rate would move the weights fast
+  # enough to lose the prior we are finetuning FOR. Matches the level-1 GeoFix
+  # config deliberately: the two stages should not be finetuned at rates that
+  # differ for no stated reason. A knob, not a finding.
+  base_lr: 1e-5
+  final_lr: 1e-5
+  beta: [0.9, 0.95]
+  wd: 0.0
+  # INERT -- kept only because the released config carries it. `build_scheduler`
+  # reads `training.scheduler.type`, never `training.schedule_type`, so the block
+  # below is what is actually in force.
+  schedule_type: 'constant'
+  clip_grad: 1.0
+
+  # LR WARMUP, and at level 0 it is MORE load-bearing than at level 1, not less.
+  # Both of this checkpoint's slots move further off-distribution than the
+  # level-1 checkpoint's did: it has seen 175k iterations of an all-zero
+  # condition slot and a within-view CONSTANT camera channel 0, and it is a
+  # SMALLER head (depth [28, 2]) absorbing the same shift. The level-1 measurement
+  # -- norms 269.5 at steps 0-9, below 10 only by ~step 70 -- is in the header.
+  #
+  # Watch the logged norms. If they do NOT fall well below 10 within the warmup,
+  # the answer is the zero-init widening route
+  # (`src/stage2/models/mask_conditioning.py`, inertness gate PASS 2026-08-11),
+  # NOT a smaller learning rate. And do not read the curve before step ~70:
+  # norms are logged only above `clip_grad * 10`, so the warning going quiet is
+  # the pass signal, which reads exactly like missing data.
+  #
+  # base_lr == final_lr makes `final_ratio` 1.0 and, with no `decay_end_steps`,
+  # the decay window collapses onto the warmup: linear ramp 0 -> 1e-5 over 100
+  # steps, then flat forever. No decay, deliberately -- a decaying LR on an
+  # open-ended finetune makes "the final step" mean something different
+  # depending on when the job happened to stop.
+  scheduler:
+    type: 'linear'
+    warmup_steps: 100
+    base_lr: 1e-5
+    final_lr: 1e-5
+
+  # THE CASCADE'S OWN FLOW: x0 is the LEVEL-1 features (plus noise), x1 is
+  # level 0. Unchanged from the release. See the asymmetry note in the header
+  # before quoting any number this produces.
+  source_level: 1
+  # OUR leg's level-1 file, NOT `model_stats/da3/normalization_stats_level1.pt`.
+  # Source and target levels have different distributions and each must be
+  # normalised with its own statistics; using the released level-1 file here
+  # while the level-1 MODEL was finetuned under our leg would feed the cascade a
+  # differently-normalised x0 than the one it meets at inference.
+  source_level_stat_path: '/fs/nexus-projects/Generative_Detection/workspace/research/uncertainty-guided-diffusion/geofix/eval/feature_stats/legs/dl3dv_art_504__imagenet/normalization_stats_level1.pt'
+  noise_tau_gt_feat: 0.0
+
+validation:
+  # ------------------------------------------------------------------------
+  # DELIBERATELY MINIMAL, and the reason is the holdout, not the clock.
+  #
+  # `val_manifest` is the FROZEN EVAL HOLDOUT. Watching its loss during training
+  # and then choosing a checkpoint by what that curve did is selection on the
+  # eval set. Checkpoint selection is fixed A PRIORI to the final step;
+  # validation runs rarely and only as a crash/NaN canary. The REPORTED numbers
+  # come from one scoring pass after training, paired per scene, PSNR and LPIPS
+  # and a high-frequency measure, never PSNR alone -- CLAUDE.md's 2026-08-23
+  # finding is that 30,000 level-1 steps bought +0.146 dB while LOSING 0.0072
+  # LPIPS on unseen scenes, so PSNR alone would have read that backwards.
+  # ------------------------------------------------------------------------
+  val_num_batches: 4
+  batch_size: 1
+  # 'propagation', as the released cascade config has it. At level 0 there is no
+  # level below to propagate up from, so 'propagation_0' (zero features for
+  # levels < current) would be the same computation by a different name; the
+  # released value is kept because it is the released value.
+  validation_mode: 'propagation'
+  ckpt_every: 500
+  sample_every: 2000
+  num_views: 8
+  # MUST equal the training cond_num. The manifest PLACED the clean references in
+  # [0, 4); the released config's "1-4" range would read three renders as
+  # references.
+  cond_num: 4
+  test_baseline: 25
+  guidance:
+    method: 'cfg'
+    scale: 1.5
+    t_min: 0.0
+    t_max: 1.0
+
+dataset:
+  # The GeoFix loader, not `cut3r_combined`. It is the only one that supplies
+  # `gt_clean` and `mask`, and `train_multiview_da3.py` refuses any geofix.*
+  # setting with a different `name`.
+  name: geofix
+
+  # Absolute: training runs from the GLD fork worktree, not from geofix/.
+  # THE SAME manifests the level-1 finetune used -- deliberately. The cascade is
+  # being finetuned to sit downstream of that model, and a different train/eval
+  # split between the two stages would leak held-out scenes into the pipeline
+  # through the back door.
+  manifest: /fs/nexus-projects/Generative_Detection/workspace/research/uncertainty-guided-diffusion/geofix/eval/train/manifest_masked_exclude_l2.json
+  val_manifest: /fs/nexus-projects/Generative_Detection/workspace/research/uncertainty-guided-diffusion/geofix/eval/train/manifest_holdout_it03000_l2.json
+
+  # Mask planes stacked in order; must match what the manifest recorded.
+  mask_types: [oracle_l2]
+  token_grid: 36
+  # Contrast exponent on the POOLED mask, applied at LOAD time. 1.0 = untouched,
+  # and it MUST match what any inference run passes as `--gamma`, because
+  # nothing in the checkpoint records it.
+  #
+  # A per-LEVEL gamma is available at inference (`geofix_infer.py
+  # --gamma-level0`, a residual exponent on top of this one). It is left at
+  # parity here: the level-0 mask this config trains with is exactly the level-1
+  # mask. Sweeping the two levels apart is an inference-time experiment, and it
+  # is OURS -- FreeFix's gamma_c schedule is per-TIMESTEP (`c_exp_index:
+  # [0.001, 0.01, 0.1]` staged by `c_scheduler: [0.3, 0.9, 1.0]`,
+  # third_party/freefix/exp_cfg/base.yaml) and pre-rasterisation, on a model with
+  # one latent resolution and no pyramid. Do not cite them as precedent.
+  #
+  # And do not re-tune gamma on blend PSNR: it is monotone, so it cannot reorder
+  # tokens and a trained network can undo it. It is an initialisation.
+  gamma: 1.0
+  # Hard rule 6: MAX, never MEAN. A thin floater mean-pooled over a 14x14 patch
+  # washes out to near-clean.
+  pooling: max
+
+  skip_bad_poses: true
+  max_translation_norm: 100
+
+  # Single resolution. Hard rule 3: rendered natively at 504, never resized. The
+  # released cascade config's four-way multi-resolution list is deliberately
+  # dropped -- resizing changes artifact statistics, and artifact statistics are
+  # the signal.
+  image_size: [[504, 504]]
+
+  num_views: 8
+  # FIXED at 4, not the released "1-4". The manifest places exactly 4 clean
+  # photographs in [0, 4); a per-batch random cond_num would slide that boundary
+  # and feed renders into reference slots.
+  cond_num: 4
+  # prefix, never random/interpolate -- those also CHOOSE which views are
+  # references, which would defeat the placement above.
+  ref_view_sampling: prefix
+  normalize_pose: true
+  camera_mode: plucker
+
+misc:
