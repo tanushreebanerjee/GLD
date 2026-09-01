@@ -701,12 +701,19 @@ def main() -> int:
               f"{float(np.mean(list(mask_pack.values()))):.4f}", flush=True)
 
     if args.mask_const is not None:
-        if not (args.mask_in_camera or args.mask_in_camera_l0):
+        # THE MASK NOW HAS TWO CONSUMERS. This guard was written when camera
+        # channel 0 was the only one, so it demanded --mask-in-camera; with
+        # --cfg-mask-mode the plane also builds the guidance weight, and the
+        # control is meaningful there without the mask ever entering the network.
+        # Requiring --mask-in-camera here is what forced the coupling that
+        # invalidated the 2026-08-31 run.
+        if not (args.mask_in_camera or args.mask_in_camera_l0
+                or args.cfg_mask_mode != "none"):
             raise SystemExit(
-                "--mask-const is the area-matched control for the camera-channel "
-                "mask and does nothing without --mask-in-camera. Add it, or drop "
-                "--mask-const rather than shipping an arm whose name says control "
-                "and whose inputs say otherwise.")
+                "--mask-const is the area-matched control for the mask, and nothing "
+                "in this arm consumes a mask: add --mask-in-camera or "
+                "--cfg-mask-mode, or drop --mask-const rather than shipping an arm "
+                "whose name says control and whose inputs say otherwise.")
         if args.blend_mask:
             # The blend path reads batch["mask"] directly, so a constant here
             # would leave the composite running on the REAL mask -- a half-control
@@ -738,12 +745,15 @@ def main() -> int:
             f"--cfg-mask-gain {args.cfg_mask_gain} without --cfg-mask-mode is inert.")
 
     if args.mask_transform != "none":
-        if not (args.mask_in_camera or args.mask_in_camera_l0):
+        # Same widening as --mask-const above: the guidance weight is a second
+        # consumer of the mask, so a placement control is meaningful for it too.
+        if not (args.mask_in_camera or args.mask_in_camera_l0
+                or args.cfg_mask_mode != "none"):
             raise SystemExit(
-                f"--mask-transform {args.mask_transform} rewrites the mask fed to "
-                "camera channel 0 and does nothing without --mask-in-camera. Add "
-                "it, or drop --mask-transform rather than shipping an arm whose "
-                "name says control and whose inputs say otherwise.")
+                f"--mask-transform {args.mask_transform} rewrites the mask, and "
+                "nothing in this arm consumes one: add --mask-in-camera or "
+                "--cfg-mask-mode, or drop --mask-transform rather than shipping an "
+                "arm whose name says control and whose inputs say otherwise.")
         if args.mask_const is not None:
             # A constant plane has no placement left to destroy, so rolling or
             # shuffling one is indistinguishable from the constant itself -- an
