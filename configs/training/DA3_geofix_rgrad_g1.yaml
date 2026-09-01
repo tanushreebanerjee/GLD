@@ -1,0 +1,333 @@
+# GeoFix -- THE FIRST DEPLOYABLE PLANE THAT BEATS THE FREE BASELINE, because it
+# IS the free baseline. `render_grad` is normalised local gradient magnitude of
+# the degraded render: no ground truth, no model, no depth, four lines of numpy.
+#
+# WHY IT IS HERE. `geofix.masknet.damage_bar`, 2026-09-01, asked how well each
+# plane that needs no ground truth predicts `oracle_l2` -- the plane that actually
+# wins as conditioning -- within frame on the 36x36 token grid, over three
+# populations (216 / 928 / 1076 frames):
+#
+#   render_grad          Spearman 0.561 / 0.520 / 0.501   AUROC 0.762 / 0.732 / 0.717
+#   sam_boundary                  0.345 / 0.296 / 0.328         0.627 / 0.612 / 0.625
+#   depth_disagree                0.054 / 0.132 / 0.039         0.550 / 0.565 / 0.541
+#   null_decoy                   -0.176 /-0.144 /-0.173         0.435 / 0.448 / 0.439
+#
+# `depth_disagree` -- the deployable candidate since session 6 -- is nearer the
+# decoy than the free baseline, which explains its end-to-end null (-0.025 dB)
+# better than "masks are hard" does.
+#
+# THE CONTROL THIS ARM NEEDS IS AN AREA-MATCHED UNIFORM MASK, not `nomask`.
+# Session 6.5 measured an arm at -0.151 dB against no-mask and +0.375 against its
+# area control, which INVERTS the conclusion. Both maps here are large at edges,
+# so part of the correlation above is a texture confound rather than placement,
+# and only the area control separates them.
+#
+# GAMMA 1.0: `render_grad` pools to mean area 0.177 at gamma 1.0. Measured on the
+# eval population, the curve is 0.20 -> 0.628, 0.25 -> 0.566, 0.30 -> 0.512,
+# 0.40 -> 0.425, 0.50 -> 0.357, 0.75 -> 0.245, 1.00 -> 0.177. This file is
+# gamma 1.0 -> pooled area ~0.18. The measured placement-value peak is 0.449.
+# Differs from its sibling in `gamma` alone.
+# GeoFix -- THE L2-POOLING ARM SET.  pooling=max
+#
+# Three configs, identical except for `dataset.pooling`, over the `oracle_l2`
+# plane:  _max (status quo) / _rms (the experiment) / _arearef (the area control).
+# Read rms MINUS arearef for placement; rms MINUS max confounds placement with
+# area and must not be quoted alone.
+#
+# GeoFix session 8 -- finetune the released level-1 checkpoint to repair 3DGS
+# artifact renders, conditioned on our uncertainty masks.
+#
+# Derived from DA3_level1.yaml. Everything not commented below is unchanged from
+# it on purpose: this is a FINETUNE, and a silently different architecture or
+# transport would make the result incomparable to the released model.
+#
+#   torchrun --standalone --nnodes=1 --nproc_per_node=1 src/train_multiview_da3.py \
+#     --config configs/training/DA3_geofix_level1.yaml \
+#     --data-path assets --results-dir results/geofix/level1 \
+#     --precision bf16 --pretrained <released GLD level-1 ckpt>
+#
+# `--pretrained` (model weights only), NOT `--ckpt` (weights+optimizer+step): we
+# are starting a new run from a released checkpoint, not resuming theirs. Hard
+# rule 2 forbids stage-2 training FROM SCRATCH; finetuning from the release is
+# the plan and always was.
+
+stage_1:
+  target: stage1.rae_da3.RAE_DA3
+  params:
+    encoder_pretrained_path: 'depth-anything/DA3-Base'
+    encoder_input_size: 504
+    encoder_type: 'DA3EncoderDirect'
+    decoder_config_path: 'configs/decoder/ViTXL'
+    da3_weights_path: 'pretrained_models/da3/model.safetensors'
+    mae_weight: './pretrained_models/mae_decoder.pt'
+    noise_tau: 0.0
+    reshape_to_2d: true
+    # HARD RULE 5. Our inputs are off-distribution, and the measurement
+    # (RESULTS.md, 2026-08-16) says mostly because they are DL3DV rather than
+    # because they carry artifacts: at level 1 the dataset term is |z|mean 0.200
+    # against 0.136 for artifacts and 0.014 for resolution. So the released
+    # RE10K-derived file is wrong for us even setting artifacts aside.
+    # Leg C = DL3DV + artifacts + 504 + ImageNet normalisation.
+    normalization_stat_path: '/fs/nexus-projects/Generative_Detection/workspace/research/uncertainty-guided-diffusion/geofix/eval/feature_stats/legs/dl3dv_art_504__imagenet/normalization_stats_level1.pt'
+
+stage_2:
+  target: stage2.models.DDT.DiTwDDTHead
+  params:
+    patch_size: 1
+    in_channels: 1536
+    hidden_size: [768, 2048]
+    depth: [28, 6]
+    num_heads: [16, 16]
+    mlp_ratio: 4.0
+    use_qknorm: false
+    use_swiglu: true
+    use_rope: false
+    use_rmsnorm: true
+    wo_shift: false
+    use_pos_embed: false
+    use_prope: true
+    architecture_mode: "new"
+    cfg_mode: "new"
+    cam_input_size: 504
+    cam_patch_size: 14
+    level: 1
+    predict_cls: false
+    is_concat_mode: true
+
+# =============================================================================
+# GeoFix conditioning -- the two slots that already exist at the right shape
+# (docs/ARCH_NOTES.md, "two conditioning slots that need no widening").
+#
+# Neither needs the `2C -> 2C + n_mask` embedder widening, so neither can be
+# confounded with "my channel surgery perturbed a 175k-iteration checkpoint".
+# The ablation ladder is exactly these two booleans over one code path.
+#
+#   cond_artifact=F mask_in_camera=F   stock GLD -- pure generation, the
+#                                      MECHANISM baseline (6.5's "arm A")
+#   cond_artifact=T mask_in_camera=F   refinement WITHOUT the mask; the honest
+#                                      baseline for "does the mask add anything"
+#   cond_artifact=T mask_in_camera=T   GeoFix proper                <- this file
+#   cond_artifact=F mask_in_camera=T   mask with nothing to preserve; diagnostic
+#                                      only, see the note in prepare_data
+# =============================================================================
+geofix:
+  # Fill latents_cond[:, cond_num:] -- which stock GLD leaves as ZEROS -- with
+  # features of the 3DGS render. In session 6.5 the render never entered the
+  # network at all; it was only a sampling-time overwrite of x_t. This is route
+  # (a) conditioning through a pathway that already exists at full C width.
+  cond_artifact: true
+
+  # Grade camera-embedding channel 0 by M_edit on the target half instead of the
+  # constant 1.0 it carries today. Polarity already agrees (channel 0 = 1 means
+  # "target, generate it"; M_edit = 1 means "repair here") so this is the one
+  # mask in the project that enters with NO sign flip -- hard rule 7 satisfied by
+  # construction rather than by a correction. CFG preserves it: the uncond branch
+  # zeroes camera channels 1: and keeps 0.
+  mask_in_camera: true
+
+  # ------------------------------------------------------------------------
+  # What the flow is supervised TOWARD. `gt_inp` from the GeoFix loader is the
+  # ARTIFACT RENDER and `gt_clean` is the clean photograph, so this is not a
+  # formality: with it unset and `cond_artifact` off, the model is trained to
+  # REPRODUCE 3DGS artifacts. Left null here = the historical default (on iff
+  # cond_artifact or bridge_x0 is on), so this config is unchanged. The NVS
+  # control sets it explicitly via --geofix-clean-target.
+  # ------------------------------------------------------------------------
+  clean_target: null
+
+  # ------------------------------------------------------------------------
+  # LATENT BRIDGE MATCHING. null = stock: x0 ~ N(0, I), the noise start GLD
+  # stage 2 was trained with. 'artifact' = x0 is the level-1 features of the
+  # render, so the flow learns F_artifact -> F_clean.
+  #
+  # NOT the img2img trick killed on 2026-08-16 -- that anchored a NOISE-trained
+  # sampler at artifact features it had never seen. Here training and sampling
+  # agree by construction.
+  #
+  # bridge_noise_tau perturbs the start, sigma ~ |N(0, tau^2)| then renormalised,
+  # because a noiseless bridge makes the t=1 map deterministic and the flow
+  # objective degenerates toward regression. Separate from
+  # training.noise_tau_gt_feat so a bridge run cannot inherit a value tuned for
+  # GLD's cross-level flow.
+  # ------------------------------------------------------------------------
+  bridge_x0: null
+  bridge_noise_tau: 0.1
+
+  # THE MASK-MODULATED BRIDGE. sigma_i = bridge_noise_tau * M_edit_i, so the start
+  # is deterministic where the mask says "clean, preserve" and noisy where it says
+  # "damaged, repair". This is the one mask injection that is SPECIFIC to a bridge:
+  # with a noise x0 there is no per-token transport distance to modulate. Needs
+  # bridge_x0=artifact and bridge_noise_tau > 0; independent of mask_in_camera, so
+  # {input, start-noise} is a 2x2 rather than one flag.
+  bridge_mask_noise: false
+
+  # LATENT BLENDING AT TRAINING TIME. Composite x_t toward the ARTIFACT features
+  # by (1 - M_edit) -- session 6.5's blend, but applied once at the sampled t
+  # instead of at every solver step.
+  #
+  # Works with EITHER x0. Under a bridge it is exactly the per-token time
+  # t_i = 1 - M_i (1 - t), an identity rather than an approximation. Under the
+  # stock noise start the algebra no longer collapses, but the operation is
+  # unchanged and is literally 6.5's blend moved into the training loop -- the
+  # direct test of why `geofix_blend_s29500` lost 0.457 dB, which was that the
+  # model met the composite for the first time at inference.
+  #
+  # The loss target is NOT modulated: clean is the truth everywhere, including
+  # where the mask says preserve.
+  blend_train: false
+
+transport:
+  params:
+    path_type: 'Linear'
+    prediction: 'velocity'
+    loss_weight: null
+    time_dist_type: 'uniform'
+
+sampler:
+  mode: ODE
+  params:
+    sampling_method: 'euler'
+    num_steps: 50
+    atol: 1.0e-6
+    rtol: 1.0e-3
+    reverse: false
+
+training:
+  camera_drop: 0.1
+  global_seed: 0
+  epochs: 1000000
+  # global_batch_size is the total ACROSS accumulation and gets floor-divided:
+  # micro_batch_size = global_batch_size // (world_size * grad_accum_steps).
+  # So 4 // (1 * 4) = 1 sample of 8 views per forward at 504x504, accumulated 4x
+  # for an effective batch of 4 samples / 32 views. Setting this to 1 yields
+  # micro_batch_size 0 and a DataLoader crash.
+  # The released run used 7 on 8xB200; one A6000 (48G) has nothing like that
+  # headroom, so the depth comes from accumulation instead.
+  global_batch_size: 4
+  grad_accum_steps: 4
+  ema_decay: 0.9995
+  num_workers: 4
+  log_every: 10
+  # 5e-5 is the released FROM-SCRATCH rate. This is a finetune of a converged
+  # 175k-iteration checkpoint on 269 samples, where that rate would move the
+  # weights fast enough to lose the prior we are finetuning FOR. Deliberately
+  # conservative; it is a knob, not a finding.
+  base_lr: 1e-5
+  final_lr: 1e-5
+  beta: [0.9, 0.95]
+  wd: 0.0
+  # INERT -- kept only because the released config carries it. `build_scheduler`
+  # reads `training.scheduler.type`, never `training.schedule_type`, so the block
+  # below is what is actually in force.
+  schedule_type: 'constant'
+  clip_grad: 1.0
+
+  # LR WARMUP -- added after the smoke test measured gradient norms of 178, 289
+  # and 985 on steps 1-3, against clip_grad 1.0. Every early step was therefore
+  # clipped to unit norm, which makes the effective learning rate a function of
+  # the gradient's direction only and the configured 1e-5 close to meaningless.
+  #
+  # This is the predicted cost of the no-surgery route, not a bug:
+  # docs/ARCH_NOTES.md, "the checkpoint saw zeros in slot 1 and a strict {0, 1}
+  # in slot 2 for all 175k iterations". Both slots now carry values it has never
+  # seen, so the first gradients are large by construction. Warmup lets the
+  # network absorb that before the LR reaches full size, rather than taking a
+  # few violently clipped steps at the start and calling it a finetune.
+  #
+  # Watch the logged norms: if they do not fall well below 10 within the warmup,
+  # the conditioning is too far off-distribution and the answer is the zero-init
+  # widening route, not a smaller LR.
+  # base_lr == final_lr makes `final_ratio` 1.0, and with no `decay_end_steps` the
+  # decay window collapses onto the warmup, so the shape is: linear ramp 0 -> 1e-5
+  # over 100 steps, then flat 1e-5 forever. No decay, deliberately -- a decaying
+  # LR on an open-ended finetune would make "the final step" mean something
+  # different depending on when the job happened to stop.
+  scheduler:
+    type: 'linear'
+    warmup_steps: 100
+    base_lr: 1e-5
+    final_lr: 1e-5
+
+validation:
+  # ------------------------------------------------------------------------
+  # DELIBERATELY MINIMAL, and the reason is the holdout, not the clock.
+  #
+  # `val_manifest` is the FROZEN EVAL HOLDOUT. Watching its loss during training
+  # and then choosing a checkpoint by what that curve did is selection on the
+  # eval set -- the exact thing this project has protected since session 6,
+  # where the rule was stated as "computing a mask is not tuning on it". A loss
+  # curve I can see IS tuning on it the moment it informs a stop.
+  #
+  # So: checkpoint selection is fixed A PRIORI to the final step. Validation
+  # runs rarely and only as a crash/NaN canary. The REPORTED holdout numbers
+  # come from one scoring pass after training (docs/SESSION_8.md) -- paired per
+  # scene, PSNR and LPIPS and a high-frequency measure, never PSNR alone.
+  #
+  # It is also expensive: 40 s/batch measured on an A6000, so 20 batches is 13
+  # minutes per validation, which at ckpt_every 500 was a large fraction of the
+  # whole run.
+  # ------------------------------------------------------------------------
+  val_num_batches: 4
+  batch_size: 1
+  validation_mode: 'propagation_0'
+  ckpt_every: 500
+  sample_every: 2000
+  num_views: 8
+  # MUST equal the training cond_num. The manifest PLACED the clean references
+  # in [0, 4); the released config's 1 would read three renders as references.
+  cond_num: 4
+  test_baseline: 25
+  guidance:
+    method: 'cfg'
+    scale: 1.5
+    t_min: 0.0
+    t_max: 1.0
+
+dataset:
+  name: geofix
+
+  # Absolute: training runs from the GLD fork worktree, not from geofix/.
+  manifest: /fs/nexus-projects/Generative_Detection/workspace/research/uncertainty-guided-diffusion/geofix/eval/train/manifest_masked_exclude_rgrad.json
+  # The frozen holdout, it_03000 only. Shares 0 splits AND 0 (level, scene, run)
+  # reconstructions with the training manifest.
+  val_manifest: /fs/nexus-projects/Generative_Detection/workspace/research/uncertainty-guided-diffusion/geofix/eval/train/manifest_holdout_it03000_rgrad.json
+
+  # Mask planes stacked in order; must match what the manifest recorded.
+  mask_types: [render_grad]
+  token_grid: 36
+  # Contrast exponent on the POOLED mask. 1.0 = untouched. The blend's optimum
+  # was a mask AREA of ~0.45. The numbers this comment used to carry --
+  # "1.0 -> 0.632 ... needs an exponent near 2.0" -- are the `oracle_abs`/
+  # `oracle_lpips` planes' and were COPIED HERE UNCHECKED; they point the wrong
+  # way for `oracle_l2`, which is a far sparser plane. MEASURED 2026-09-01 on the
+  # 216-frame unseen_sub3 population, max-pooled to 36x36:
+  #   gamma  0.25   0.40   0.50   0.60   0.75   1.00   1.50   2.00
+  #   area   0.654  0.521  0.451  0.394  0.326  0.244  0.150  0.100
+  # So the target area is reached by LOWERING gamma to ~0.5, not raising it to
+  # 2.0, and the status quo (1.0) sits at little more than half the target.
+  # gamma is monotone so it cannot reorder tokens and a trained network can undo
+  # it. Do not re-tune it on blend PSNR.
+  gamma: 1.0
+
+  # THE STATUS-QUO POOLING, on the L2 plane. Hard rule 6. This is the arm the
+  # other two are read against, and it is what every previous GeoFix arm used.
+  pooling: max
+
+  skip_bad_poses: true
+  max_translation_norm: 100
+
+  # Single resolution. Hard rule 3: rendered natively at 504, never resized.
+  image_size: [[504, 504]]
+
+  num_views: 8
+  # FIXED at 4, not the released "1-4" range. The manifest places exactly 4 clean
+  # photographs in [0, 4); a per-batch random cond_num would slide that boundary
+  # and feed renders into reference slots.
+  cond_num: 4
+  # prefix, never random/interpolate -- those also CHOOSE which views are
+  # references, which would defeat the placement above.
+  ref_view_sampling: prefix
+  normalize_pose: true
+  camera_mode: plucker
+
+misc:
