@@ -1013,8 +1013,12 @@ def main() -> int:
         # control at one level and the real thing at the other, and the arm would
         # still be called a control. With both level-0 flags off this is `msk`
         # under a different name and every existing run is unchanged.
+        # `--cfg-mask-mode` is a THIRD consumer, exactly like `--bridge-mask-noise`
+        # below: it needs the mask with slot 2 OFF, because the whole point is that
+        # the guidance weight reads the mask while the network's input does not.
         msk_any = (batch["mask"]
-                   if (args.mask_in_camera or args.mask_in_camera_l0) else None)
+                   if (args.mask_in_camera or args.mask_in_camera_l0
+                       or args.cfg_mask_mode != "none") else None)
         # The mask-modulated bridge needs the mask even with slot 2 OFF --
         # that combination is the arm that isolates the transport schedule
         # from the input channel.
