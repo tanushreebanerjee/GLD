@@ -976,7 +976,23 @@ class DiTwDDTHead(nn.Module):
                     "to fall back to camera channel 0 -- that couples the guidance "
                     "weight to a network input and silently requires --mask-in-camera.")
             m = cfg_mask_plane.to(dtype=cond_eps.dtype)
-            m = torch.cat([m, m], dim=0) if m.shape[0] == half_n else m
+            # MATCH `cond_eps`, WHICH IS THE UN-DOUBLED BATCH. `x` is duplicated
+            # for CFG before the forward, but `cond_eps`/`uncond_eps` come back out
+            # of a split at `half_n = x.shape[0]` -- so a plane already at `half_n`
+            # is the right size and a plane at `2*half_n` is the doubled one and
+            # needs halving. An earlier version had this exactly backwards and
+            # doubled the already-correct case, which broadcast-failed at the
+            # guidance multiply (`tensor a (16) must match tensor b (8)`). Cheap to
+            # get wrong and loud to get wrong, but only because the shapes happen
+            # not to broadcast; at V=1 they would have, silently.
+            n = cond_eps.shape[0]
+            if m.shape[0] == 2 * n:
+                m = m[:n]          # both halves carry the same plane
+            elif m.shape[0] != n:
+                raise ValueError(
+                    f"cfg_mask_plane has batch {m.shape[0]}, expected {n} (or {2*n} "
+                    "for the CFG-doubled form). The guidance weight has to be "
+                    "per-sample aligned with cond_eps or it weights the wrong frame.")
             if m.shape[-2:] != cond_eps.shape[-2:]:
                 # The camera embedding is at IMAGE resolution and eps is on the
                 # 36x36 token grid (the patch embedding happens inside the model),
