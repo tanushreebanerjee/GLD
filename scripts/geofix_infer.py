@@ -599,6 +599,10 @@ def main() -> int:
                          "mode a deployable mask may use; 'rms' and "
                          "'max_arearef_rms' are the L2-oracle pair and both read "
                          "the oracle plane, so neither is deployable.")
+    ap.add_argument("--allow-short-samples", action="store_true",
+                    help="skip a sample whose target count != num_views - cond_num "
+                         "instead of failing. The skip preserves the global sample "
+                         "index, so every other sample draws identical noise.")
     ap.add_argument("--seed", type=int, default=0,
                     help="Fixed across arms so xT is identical and the comparison is paired.")
     ap.add_argument("--limit", type=int, default=None, help="Smoke: first N samples only.")
@@ -924,13 +928,27 @@ def main() -> int:
 
     skipped = 0
     processed = 0
+    short_skipped: list[dict] = []
     for done, i in enumerate(indices):
         sample = dataset.samples[i]
         split = sample["split"]                     # already "K_06/<scene>__run_XXX__it_YYYYY"
         stems = list(sample["targets"])
         if len(stems) != v - cond:
-            raise ValueError(
-                f"sample {i} ({split}) has {len(stems)} targets, expected {v - cond}.")
+            # A malformed manifest must still fail loudly, so this stays fatal by
+            # default. The one legitimate case is a manifest we did not build and
+            # cannot rebuild mid-flight: SyncFix's authors' eval export splits one
+            # reconstruction across two tar shards, and the converter emitted it as
+            # two 2-target samples with DIFFERENT reference sets (2 of 155 samples,
+            # 4 of 616 views). Skipping keeps the global index -- and therefore
+            # every other sample's noise -- identical to an uninterrupted run, so
+            # the arms stay paired; repairing the manifest instead would reindex
+            # samples 99..154 and silently unpair them from work already on disk.
+            if not args.allow_short_samples:
+                raise ValueError(
+                    f"sample {i} ({split}) has {len(stems)} targets, expected "
+                    f"{v - cond}. Pass --allow-short-samples to skip it instead.")
+            short_skipped.append({"index": i, "split": split, "n_targets": len(stems)})
+            continue
 
         # RESUME. The per-sample seed keys off the GLOBAL index i, not off the
         # loop counter, so skipping a finished sample leaves every remaining
@@ -1329,6 +1347,7 @@ def main() -> int:
         "cond_num": cond,
         "views_written": "target only, [cond_num, num_views)",
         "seed_scheme": "args.seed + sample_index (paired across arms)",
+        "short_samples_skipped": short_skipped,
         "cfg_scale": ctx["cfg_scale"],
         # Rule 14: a conditioning knob goes in the provenance dict in the SAME
         # change that adds the knob, and is asserted at the point of USE (the
