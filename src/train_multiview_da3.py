@@ -1124,6 +1124,20 @@ def main(args):
         if "ema" in checkpoint:
             ema.load_state_dict(checkpoint["ema"])
         opt_state = checkpoint.get("opt")
+        # A STRIPPED CHECKPOINT MUST NOT RESUME SILENTLY. `opt` is half of an
+        # 11.7 GB checkpoint (5.84 GB of it), so `slurm/ckpt_strip_opt.py` drops
+        # it from every checkpoint that is not the newest of its arm. The load
+        # below is guarded by `is not None`, which means a stripped file would
+        # restore model + EMA + train_steps and then rebuild Adam from scratch --
+        # the exact step-0 restart the requeue fix exists to prevent, and it
+        # would be invisible in the log. Fail here instead; the newest checkpoint
+        # of every arm keeps its optimizer state precisely so a resume has one.
+        if checkpoint.get("opt_stripped") and opt_state is None:
+            raise RuntimeError(
+                f"{args.ckpt} has had its optimizer state stripped to save disk "
+                f"({checkpoint.get('opt_stripped')}). Resuming from it would "
+                f"restart Adam at step 0 while the log claimed a resume. Use the "
+                f"newest checkpoint of this arm, which keeps its optimizer state.")
         sched_state = checkpoint.get("scheduler")
         train_steps = int(checkpoint.get("train_steps", 0))
 
