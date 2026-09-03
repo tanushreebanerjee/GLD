@@ -376,6 +376,35 @@ class GeoFixPairs(Dataset):
                 "config at a manifest built for these planes, or drop the "
                 "config's dataset.mask_types and inherit the manifest's.")
         self.mask_types = want
+        # AND THE PLANES MUST ACTUALLY BE ON DISK. The check above compares one
+        # LIST OF NAMES against another, so a manifest that declares its planes
+        # and carries `has_mask: false` on every target view sails through it --
+        # and `_mask()` then returns `torch.zeros`, which under `edit1` tells the
+        # network "this degraded frame is clean, repair nothing". Every batch.
+        # Silently.
+        #
+        # This is the same defect the 633-scene corpus hit on 2026-09-02 (caught
+        # by hand, before the arms started) and that `manifest_scale100.json`
+        # still carries: `mask_types: [oracle_lpips]`, `masks_on_disk: false`,
+        # 4,528 target views all `has_mask: false`. `geofix.tools.retarget_manifest`
+        # refuses to WRITE such a manifest; nothing refused to READ one, so the
+        # guard was only on the path that happened to have been used.
+        #
+        # The arm that trains on it does not fail -- it produces a clean null and
+        # the null reads as "the mask does not help", which is hard rule 14's
+        # exact failure mode one layer down: the config and the manifest agree,
+        # and the DATA does not.
+        n_masked = sum(sum(bool(h) for h in s["has_mask"]) for s in self.samples)
+        if want and n_masked == 0:
+            raise ValueError(
+                f"{self.manifest_path.name} declares mask_types={m['mask_types']} "
+                f"but not one of its {sum(len(s['has_mask']) for s in self.samples)} "
+                "target views has a mask on disk, so every mask this dataset "
+                "yields would be all-zero -- i.e. 'clean, repair nothing' on a "
+                "degraded frame, for the whole run. Rebuild the manifest with "
+                "`python -m geofix.tools.retarget_manifest --sync-has-mask` once "
+                "the packs exist, or pass --geofix-no-mask if a maskless arm is "
+                "what you meant.")
         self.gamma = float(gamma)
         # Measured as mean(depth_disagree max area) / mean(obs_K rms area) =
         # 0.488 / 0.713 over 320 training frames, i.e. the factor that centres the
