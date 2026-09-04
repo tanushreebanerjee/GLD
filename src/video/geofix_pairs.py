@@ -143,6 +143,23 @@ def pool_mask(plane: np.ndarray, grid: int, mode: str = "max") -> torch.Tensor:
     """
     a = plane[None] if plane.ndim == 2 else plane
     t = torch.from_numpy(np.ascontiguousarray(a)).float().div_(255.0)
+    if mode == "none":
+        # NATIVE RESOLUTION -- no pooling at all, returns (c, 504, 504) rather
+        # than (c, grid, grid). For the sub-token oracle only; see
+        # `geofix.masks.add_native_plane` for why the plane must be AREA-MATCHED
+        # before it gets here (MAX pooling inflates area 27% on this split, and
+        # area has moved PSNR by more than any placement effect ever measured).
+        #
+        # It is safe downstream BECAUSE OF TWO PROPERTIES, both checked rather
+        # than assumed: `prepare_data`'s shape guard constrains only (B, V, 1)
+        # and never `g`, and its `interpolate(size=(H, W), mode="nearest")` is an
+        # IDENTITY on a plane already at (H, W). So the native plane reaches
+        # `camera_embedder` unresampled and gets patchified 504 -> 36 from the
+        # true plane, instead of from a 36-grid one upsampled back to 504. That
+        # difference IS the experiment.
+        #
+        # NOT deployable and not a training mode: it reads the oracle plane.
+        return t
     if mode == "rms":
         # The token's own RMSE. See `geofix.masks.pooling`; ORACLES ONLY.
         return F.adaptive_avg_pool2d(t.pow(2), (grid, grid)).sqrt()

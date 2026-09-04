@@ -593,12 +593,15 @@ def main() -> int:
     ap.add_argument("--gamma", type=float, default=1.0,
                     help="Contrast exponent on the pooled mask; must match training.")
     ap.add_argument("--pooling", default="max",
-                    choices=("max", "mean", "rms", "max_arearef_rms"),
+                    choices=("max", "mean", "rms", "max_arearef_rms", "none"),
                     help="How the 504x504 mask plane is reduced to the token grid. "
                          "MUST match training. 'max' is hard rule 6 and the only "
                          "mode a deployable mask may use; 'rms' and "
                          "'max_arearef_rms' are the L2-oracle pair and both read "
-                         "the oracle plane, so neither is deployable.")
+                         "the oracle plane, so neither is deployable. 'none' skips "
+                         "pooling entirely and hands the 504x504 plane through for "
+                         "the sub-token oracle -- oracle-only, and the plane must "
+                         "already be area-matched (geofix.masks.add_native_plane).")
     ap.add_argument("--allow-short-samples", action="store_true",
                     help="skip a sample whose target count != num_views - cond_num "
                          "instead of failing. The skip preserves the global sample "
