@@ -145,7 +145,26 @@ MASK_SUFFIX = ".edit1.npz"
 #:                     Both parents are DEPLOYABLE, so this is the first plane in
 #:                     the project carrying frame-level severity AND within-frame
 #:                     placement without touching the ground truth.
-POOLING_MODES = ("max", "mean", "rms", "max_arearef_rms", "max_sevref_obsk")
+#:   none              NO POOLING. The plane reaches the model at its native 504x504.
+#:                     Everything else here pools to the 36x36 token grid at LOAD
+#:                     time, which is where sub-token structure is destroyed -- not
+#:                     in the model. `prepare_data` upsamples 36->504 with nearest
+#:                     and `camera_embedder` patchifies 504->36, so the mask makes a
+#:                     lossy round trip and the pooling step is the only lossy one.
+#:                     Its assertion checks `(B, V, 1, *, *)` and never the grid, and
+#:                     the upsample is a no-op at native resolution, so a full-res
+#:                     plane flows through untouched and the patch embed -- a LINEAR
+#:                     map over 196 pixels, not a mean -- can encode within-patch
+#:                     structure.
+#:
+#:                     ONLY VALID FOR `mask_in_camera`. The bridge-noise and
+#:                     blend-train routes index the mask against 36x36 latents and
+#:                     will raise on the shape, which is the intended behaviour: a
+#:                     loud failure, not a silent resample.
+POOLING_MODES = ("max", "mean", "rms", "max_arearef_rms", "max_sevref_obsk", "none")
+
+#: DA3 patch size. 504 / 14 = 36 exactly (hard rule 3).
+DA3_PATCH = 14
 
 
 def pool_mask(plane: np.ndarray, grid: int, mode: str = "max") -> torch.Tensor:
@@ -500,7 +519,10 @@ class GeoFixPairs(Dataset):
         """
         g = self.token_grid
         if not present:
-            return torch.zeros(self.n_mask, g, g)
+            # Same resolution the present-case returns, or the collate cannot stack
+            # a mixed batch -- and `none` returns the plane at native size.
+            side = g * DA3_PATCH if self.pooling == "none" else g
+            return torch.zeros(self.n_mask, side, side)
         z = np.load(self.artifact_root / split / "masks" / f"{frame}{MASK_SUFFIX}",
                     allow_pickle=True)
         pol = str(z["polarity"])
@@ -513,8 +535,20 @@ class GeoFixPairs(Dataset):
             return self._mask_arearef(z, g)
         if self.pooling == "max_sevref_obsk":
             return self._mask_sevref_obsk(z, g)
-        m = torch.cat([pool_mask(z[t], g, self.pooling) for t in self.mask_types],
-                      dim=0)
+        if self.pooling == "none":
+            # No pooling: hand the plane over at its native resolution. Still
+            # normalised to float [0,1] exactly as pool_mask does, so gamma and
+            # every consumer downstream behave identically.
+            planes = []
+            for t in self.mask_types:
+                a = z[t]
+                a = a[None] if a.ndim == 2 else a
+                a = torch.from_numpy(np.ascontiguousarray(a)).float()
+                planes.append(a / 255.0 if a.max() > 1.5 else a)
+            m = torch.cat(planes, dim=0)
+        else:
+            m = torch.cat([pool_mask(z[t], g, self.pooling) for t in self.mask_types],
+                          dim=0)
         # Applied to the POOLED mask, matching how session 6.5 measured it.
         # Monotone, so it cannot reorder tokens -- only rescale the area.
         if self.gamma != 1.0:
