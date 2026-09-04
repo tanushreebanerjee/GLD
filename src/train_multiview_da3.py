@@ -219,7 +219,19 @@ def prepare_data(
                         "geofix_mask_fn needs 4D artifact features (B*V, C, g, g); "
                         f"got {None if art_spatial is None else tuple(art_spatial.shape)}. "
                         "Pass artifact_images so they are encoded.")
-                geofix_mask = geofix_mask_fn(art_spatial, B, V, int(random_cond_num))
+                # enable_grad INSIDE the enclosing `with torch.no_grad():` that wraps
+                # lines 145-241. Without it the masknet's forward builds no graph and
+                # the head receives nothing -- caught by the step-100 assert on the
+                # first smoke (job 7447108, "received NO gradient by step 4599"),
+                # which is exactly the silent no-op that assert exists for.
+                #
+                # Only the FORWARD needs re-enabling: the mask's consumers are all
+                # outside this block (random_masks at ~293, camera_embedding at ~321),
+                # so once the tensor carries a graph the rest of the path already
+                # propagates. `art_spatial` stays a no_grad tensor, which is what we
+                # want -- the RAE encoder is frozen and should get no gradient.
+                with torch.enable_grad():
+                    geofix_mask = geofix_mask_fn(art_spatial, B, V, int(random_cond_num))
 
         # C. Merge: Reference part from 'ref-only' pass, Target part from 'all' pass
     # latents_all is (B*V, C, ...)
