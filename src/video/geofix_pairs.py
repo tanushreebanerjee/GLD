@@ -395,6 +395,21 @@ class GeoFixPairs(Dataset):
         """Channels the mask occupies. Must equal the model's `n_mask`."""
         return int(self.m["n_mask"])
 
+    @property
+    def mask_side(self) -> int:
+        """Spatial side of EVERY mask this dataset emits, pooled or not.
+
+        THE THREE SITES THAT BUILD A MASK MUST AGREE ON THIS OR THE BATCH CANNOT
+        STACK, and they drifted the first time `pooling: none` was added: `_mask`
+        was taught the native size while the two reference-view builders kept
+        `(g, g)` hardcoded, so a sample stacked [1,36,36] for its 4 refs against
+        [1,504,504] for its 4 targets and died in `build_batch` (job 7447922).
+        A reference view carries a ZERO mask rather than no mask, so it is just
+        as size-bound as a target -- which is easy to miss, because the refs are
+        the views the mask is not about.
+        """
+        return self.token_grid * DA3_PATCH if self.pooling == "none" else self.token_grid
+
     # -- loading ----------------------------------------------------------
 
     def _img(self, path: pathlib.Path) -> torch.Tensor:
@@ -422,8 +437,7 @@ class GeoFixPairs(Dataset):
         if not present:
             # Must match the present-case resolution or a batch mixing masked and
             # unmasked frames cannot be stacked; `none` returns native size.
-            side = g * DA3_PATCH if self.pooling == "none" else g
-            return torch.zeros(self.n_mask, side, side)
+            return torch.zeros(self.n_mask, self.mask_side, self.mask_side)
         z = np.load(self.artifact_root / split / "masks" / f"{frame}{MASK_SUFFIX}",
                     allow_pickle=True)
         pol = str(z["polarity"])
@@ -498,7 +512,7 @@ class GeoFixPairs(Dataset):
                 "camera_pose": pose,
                 "camera_intrinsics": K,
                 "idx": (i, 0, int(e["slot"])),
-                "mask": torch.zeros(self.n_mask, g, g),
+                "mask": torch.zeros(self.n_mask, self.mask_side, self.mask_side),
                 "is_ref": torch.tensor(True),
             }
             if self.return_gt:
@@ -545,7 +559,7 @@ class GeoFixPairs(Dataset):
                 "camera_pose": pose,
                 "camera_intrinsics": K,
                 "idx": (i, 0, int(e["slot"])),
-                "mask": torch.zeros(self.n_mask, g, g),
+                "mask": torch.zeros(self.n_mask, self.mask_side, self.mask_side),
                 "is_ref": torch.tensor(True),
             }
             if self.return_gt:
