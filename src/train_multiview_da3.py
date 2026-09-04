@@ -85,6 +85,7 @@ def prepare_data(
     return_scale: bool = False,
     artifact_images=None,
     geofix_mask=None,
+    geofix_mask_fn=None,
     cond_artifact: bool = True,
     return_artifact: bool = False,
 ):
@@ -104,6 +105,11 @@ def prepare_data(
             because `latents_all` is the flow TARGET. Two encodes, deliberately:
             the model is conditioned on the artifact and supervised toward clean.
 
+        geofix_mask_fn: optional `f(art_feats, B, V, cond_num) -> (B, V, 1, g, g)`.
+            When given it REPLACES `geofix_mask`, and the mask becomes a
+            differentiable function of the artifact features rather than a
+            constant, so a predictor can be trained by the diffusion loss.
+            See `video/masknet_joint.py`.
         geofix_mask: (B, V, 1, g, g) `edit1` mask on the token grid, 1 = "repair
             here". Replaces the constant 1.0 that target views carry in camera
             channel 0. Nearest-upsampled to (H, W) so each token maps onto its own
@@ -184,14 +190,36 @@ def prepare_data(
                     f"images {tuple(images.shape)}.")
             art_norm = (artifact_images.to(device, non_blocking=True)
                         - rae.encoder_mean[None]) / rae.encoder_std[None]
+            art_spatial = None      # (B*V, C, g, g) BEFORE any packing
             if return_cls:
                 latents_art, cls_art = rae.encode(art_norm, return_cls=True)
                 BVa, C_a, h_a, w_a = latents_art.shape
+                art_spatial = latents_art
                 latents_art = torch.cat(
                     [cls_art.reshape(BVa, C_a, 1, 1),
                      latents_art.reshape(BVa, C_a, h_a * w_a, 1)], dim=2)
             else:
                 latents_art = rae.encode(art_norm)
+                art_spatial = latents_art
+
+            # GeoFix JOINT MASKNET (slot 2, in-graph). `geofix_mask` is normally a
+            # CONSTANT read from an .npz pack, so nothing flows back to whatever
+            # produced it. Given a callable, the mask is PREDICTED here instead,
+            # from the artifact features this function has just encoded, and the
+            # diffusion loss can therefore train the predictor.
+            #
+            # The hook is HERE, and not in the training loop, for one reason: the
+            # mask is an INPUT to this function while `latents_art` is produced
+            # INSIDE it, so a caller cannot read the features out and feed a mask
+            # back in without a second encoder pass. A callback closes the loop
+            # with no extra forward.
+            if geofix_mask_fn is not None:
+                if art_spatial is None or art_spatial.ndim != 4:
+                    raise ValueError(
+                        "geofix_mask_fn needs 4D artifact features (B*V, C, g, g); "
+                        f"got {None if art_spatial is None else tuple(art_spatial.shape)}. "
+                        "Pass artifact_images so they are encoded.")
+                geofix_mask = geofix_mask_fn(art_spatial, B, V, int(random_cond_num))
 
         # C. Merge: Reference part from 'ref-only' pass, Target part from 'all' pass
     # latents_all is (B*V, C, ...)
@@ -1075,6 +1103,8 @@ def main(args):
     requires_grad(ema, False)
     opt_state = None
     sched_state = None
+    joint_state = None          # GeoFix joint masknet weights, if the ckpt carries them
+    joint_opt_state = None
     train_steps = 0
     ckpt_meta = None
 
@@ -1139,6 +1169,8 @@ def main(args):
                 f"restart Adam at step 0 while the log claimed a resume. Use the "
                 f"newest checkpoint of this arm, which keeps its optimizer state.")
         sched_state = checkpoint.get("scheduler")
+        joint_state = checkpoint.get("joint_masknet")
+        joint_opt_state = checkpoint.get("joint_masknet_opt")
         train_steps = int(checkpoint.get("train_steps", 0))
 
     model_param_count = sum(p.numel() for p in model.parameters())
@@ -1147,6 +1179,53 @@ def main(args):
     model = DDP(model, device_ids=[device_idx], gradient_as_bucket_view=False)
 
     opt, opt_msg = build_optimizer(model.parameters(), training_cfg)
+
+    # GeoFix JOINT MASKNET. A SEPARATE optimizer, deliberately, not a second param
+    # group on `opt`: build_scheduler ends with
+    #     for group in optimizer.param_groups: group["lr"] = base_lr
+    # which overwrites a per-group LR every time it runs. The arm would then record
+    # --geofix-masknet-lr in its provenance and train at the GLD LR, and nothing
+    # would fail. Its own optimizer is untouched by that loop.
+    # Optimizer updates (not train_steps) before the gradient check fires: this
+    # arm warm-starts from a finetuned checkpoint, so train_steps begins at 4,500
+    # and any absolute step would never be reached.
+    _MASKNET_GRAD_CHECK_UPDATES = 100
+    _mn_updates = 0
+    geofix_masknet_anchor = float(getattr(args, "geofix_masknet_anchor", 0.0) or 0.0)
+    joint_masknet = None
+    joint_masknet_opt = None
+    joint_mask_fn = None
+    if getattr(args, "geofix_masknet_joint", None):
+        from video.masknet_joint import JointMaskNet
+        joint_masknet = JointMaskNet(args.geofix_masknet_joint, device)
+        joint_masknet_opt = torch.optim.AdamW(
+            joint_masknet.parameters(), lr=float(args.geofix_masknet_lr),
+            betas=(0.9, 0.95), weight_decay=0.0)
+
+        def joint_mask_fn(feats, B, V, cond_num, _mn=joint_masknet):
+            m = _mn(feats, B, V, cond_num)
+            _mn.last = m          # kept for the anchor loss and the area diagnostic
+            return m
+
+        # A RESUME MUST RESTORE THE HEAD, not silently re-load the pretrained one.
+        # Without this the diffusion model comes back at step N while the mask head
+        # snaps back to where joint training started, and the log would say
+        # "resumed" either way.
+        if joint_state is not None:
+            joint_masknet.load_state_dict(joint_state, strict=True)
+            if joint_opt_state is not None:
+                joint_masknet_opt.load_state_dict(joint_opt_state)
+            print("[geofix] joint masknet RESTORED from the checkpoint "
+                  f"(opt state: {'yes' if joint_opt_state is not None else 'NO'})", flush=True)
+        elif getattr(args, "ckpt", None):
+            print("[geofix] NOTE: --ckpt given but it carries no joint masknet; "
+                  "starting the head from the pretrained file instead.", flush=True)
+
+        print(f"[geofix] joint masknet: {args.geofix_masknet_joint} "
+              f"(head trained to step {joint_masknet.step_trained_from}), "
+              f"{sum(q.numel() for q in joint_masknet.parameters()):,} params, "
+              f"lr={args.geofix_masknet_lr}, anchor={args.geofix_masknet_anchor}",
+              flush=True)
     if opt_state is not None:
         opt.load_state_dict(opt_state)
 
@@ -1640,6 +1719,7 @@ def main(args):
                     random_cond_num=batch_cond_num, return_cls=True,
                     camera_mode=camera_mode, return_scale=use_prope,
                     artifact_images=artifact_images, geofix_mask=geofix_mask,
+                    geofix_mask_fn=joint_mask_fn,
                     cond_artifact=geofix_cond_artifact,
                     return_artifact=(geofix_bridge or geofix_blend_train)
                 )
@@ -1654,6 +1734,7 @@ def main(args):
                     random_cond_num=batch_cond_num, return_cls=False,
                     camera_mode=camera_mode, return_scale=use_prope,
                     artifact_images=artifact_images, geofix_mask=geofix_mask,
+                    geofix_mask_fn=joint_mask_fn,
                     cond_artifact=geofix_cond_artifact,
                     return_artifact=(geofix_bridge or geofix_blend_train)
                 )
@@ -2096,6 +2177,25 @@ def main(args):
                 geofix_step["frac"] += mask_frac_tensor.item()
                 geofix_step["n"] += 1
             
+            # GeoFix JOINT MASKNET: hybrid anchor. Without it the diffusion loss is
+            # free to drive the predicted mask to a constant -- the network simply
+            # learns to ignore a channel that carries nothing -- and the arm would
+            # then read as "the mask does nothing" rather than as a collapsed head.
+            # The anchor is an L2 back to the ORACLE plane the packs already hold,
+            # over target views only (reference slots are forced to 0 and would
+            # otherwise contribute a free, meaningless zero-vs-zero term).
+            # anchor=0 gives a pure unfreeze.
+            if (joint_masknet is not None and geofix_masknet_anchor > 0
+                    and getattr(joint_masknet, "last", None) is not None
+                    and geofix_mask_tokens is not None):
+                _pred = joint_masknet.last[:, batch_cond_num:]
+                _tgt = geofix_mask_tokens[:, batch_cond_num:].to(
+                    device=_pred.device, dtype=_pred.dtype)
+                _anchor = torch.nn.functional.mse_loss(_pred, _tgt)
+                loss_tensor = loss_tensor + geofix_masknet_anchor * _anchor
+                geofix_step["mn_anchor"] = geofix_step.get("mn_anchor", 0.0) + float(_anchor.detach())
+                geofix_step["mn_area"] = geofix_step.get("mn_area", 0.0) + float(_pred.detach().mean())
+
             # Use no_sync() for all but the last accumulation step to avoid unnecessary communication
             if (accum_counter + 1) % grad_accum_steps != 0:
                 with model.no_sync():
@@ -2134,6 +2234,34 @@ def main(args):
                 if grad_norm > clip_grad * 10:
                     logger.warning(f"[Step {train_steps}] Large gradient norm before clipping: {grad_norm:.2f}")
                 
+            # GeoFix JOINT MASKNET: its own optimizer, stepped alongside.
+            if joint_masknet_opt is not None:
+                # ASSERT THE GRADIENT ACTUALLY ARRIVED (hard rule 14: a knob the
+                # consumer never reads is worse than an absent one, because the
+                # provenance says it was honoured). The mask is ONE channel among
+                # 2C into a patch embed; if nothing flows, this arm is a no-mask
+                # run wearing a joint label and no assertion would fire.
+                # Checked once, after warmup: camera-channel conditioning needs
+                # ~70 steps before its norms mean anything.
+                _mn_updates += 1
+                if _mn_updates == _MASKNET_GRAD_CHECK_UPDATES:
+                    _gn = sum(float((q.grad ** 2).sum())
+                              for q in joint_masknet.parameters() if q.grad is not None) ** 0.5
+                    _ng = sum(1 for q in joint_masknet.parameters() if q.grad is not None)
+                    print(f"[geofix] joint masknet grad check @ step {train_steps}: "
+                          f"{_ng}/{len(list(joint_masknet.parameters()))} tensors, "
+                          f"norm {_gn:.4e}", flush=True)
+                    if not (_gn > 0):
+                        raise RuntimeError(
+                            f"joint masknet received NO gradient by step {train_steps}. "
+                            "The arm would be indistinguishable from a frozen-mask run. "
+                            "Check that geofix_mask_fn is reaching prepare_data and that "
+                            "mask_in_camera is on.")
+                if clip_grad > 0:
+                    torch.nn.utils.clip_grad_norm_(joint_masknet.parameters(), clip_grad)
+                joint_masknet_opt.step()
+                joint_masknet_opt.zero_grad()
+
             opt.step()
             schedl.step()
             update_ema(ema, model.module, decay=ema_decay)
@@ -2168,6 +2296,13 @@ def main(args):
                         "ema": ema.state_dict(),
                         "opt": opt.state_dict(),
                         "scheduler": schedl.state_dict(),
+                        # GeoFix joint masknet. Without this a resume restores the
+                        # diffusion model and silently re-loads the PRETRAINED head,
+                        # throwing away every step of joint training since the last
+                        # restart -- and nothing would report it.
+                        **({"joint_masknet": joint_masknet.state_dict(),
+                            "joint_masknet_opt": joint_masknet_opt.state_dict()}
+                           if joint_masknet is not None else {}),
                         "args": vars(args),
                         "train_steps": train_steps,
                         # F3: the RESOLVED GeoFix conditioning, so a scorer can
@@ -2266,6 +2401,13 @@ def main(args):
                         "ema": ema.state_dict(),
                         "opt": opt.state_dict(),
                         "scheduler": schedl.state_dict(),
+                        # GeoFix joint masknet. Without this a resume restores the
+                        # diffusion model and silently re-loads the PRETRAINED head,
+                        # throwing away every step of joint training since the last
+                        # restart -- and nothing would report it.
+                        **({"joint_masknet": joint_masknet.state_dict(),
+                            "joint_masknet_opt": joint_masknet_opt.state_dict()}
+                           if joint_masknet is not None else {}),
                         "train_steps": train_steps,
                         "epoch": epoch,
                         "steps_per_epoch": steps_per_epoch,
@@ -2506,6 +2648,24 @@ if __name__ == "__main__":
                              "features of the 3DGS render instead of at noise, so "
                              "the model learns F_artifact -> F_clean. Overrides "
                              "geofix.bridge_x0.")
+    parser.add_argument("--geofix-masknet-joint", default=None, metavar="CKPT",
+                        help="JOINT TRAINING: predict the conditioning mask in-graph "
+                             "from a pretrained geofix MaskNet at CKPT instead of "
+                             "loading it from the .npz packs, and train that head "
+                             "with the diffusion loss. See video/masknet_joint.py.")
+    parser.add_argument("--geofix-masknet-lr", type=float, default=1e-5,
+                        help="LR for the joint MaskNet. It gets its OWN optimizer, "
+                             "not a second param group: build_scheduler ends with "
+                             "`for group in optimizer.param_groups: group['lr'] = "
+                             "base_lr`, so a group-level LR would be silently "
+                             "overwritten and the provenance would claim a value "
+                             "that never applied.")
+    parser.add_argument("--geofix-masknet-anchor", type=float, default=0.1,
+                        help="Weight of an auxiliary L2 from the predicted mask to "
+                             "the oracle plane on disk. 0 = pure unfreeze. Non-zero "
+                             "keeps the head from collapsing to a constant, the "
+                             "standard learned-gate failure, which would read as "
+                             "'the mask does nothing' rather than as a bug.")
     parser.add_argument("--geofix-blend-train", action="store_true",
                         help="LATENT BLENDING AT TRAINING TIME: composite x_t "
                              "toward the artifact features by (1 - M_edit), which "
