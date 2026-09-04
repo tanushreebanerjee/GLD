@@ -885,6 +885,29 @@ def main() -> int:
             f"manifest mask_pooling is {manifest['mask_pooling']!r}, which does not "
             f"mention MAX. Hard rule 6 requires max pooling to the token grid; a "
             f"manifest built with mean pooling cannot be scored as if it were max.")
+    # `--pooling none` LEAVES THE MASK AT 504 AND EVERY OTHER MASK CONTROL ASSUMES
+    # 36. `--mask-transform roll` says so in its own help ("on the 36x36 TOKEN
+    # grid"); `--mask-const match` matches area on the token grid; `--mask-pack`
+    # ships 36x36 planes; blending composites at the token grid. None of them
+    # would ERROR on a 504 plane -- roll would shift 1/14th as far and report a
+    # placement control that moved almost nothing -- so they are refused together
+    # rather than left to produce a silently wrong number. This is the same class
+    # as hard rule 14: assert at the point of USE.
+    if pooling == "none":
+        _conflicts = [n for n, v in (
+            ("--mask-transform", args.mask_transform not in (None, "none")),
+            ("--mask-const", args.mask_const is not None),
+            ("--mask-pack", args.mask_pack is not None),
+            ("--blend-mask", bool(getattr(args, "blend_mask", False))),
+            ("--cfg-mask-mode", args.cfg_mask_mode not in (None, "none")),
+        ) if v]
+        if _conflicts:
+            raise ValueError(
+                f"--pooling none leaves the mask at {ctx['token_grid'] * 14}x"
+                f"{ctx['token_grid'] * 14}, but {', '.join(_conflicts)} operate on the "
+                f"{ctx['token_grid']}x{ctx['token_grid']} token grid and would be "
+                "silently wrong rather than fail. Run the native oracle on its own.")
+
     dataset = GeoFixPairs(
         args.manifest,
         mask_types=list(manifest["mask_types"]),
