@@ -126,7 +126,19 @@ MASK_SUFFIX = ".edit1.npz"
 #:                     Same area, max's ranking -- so an rms-vs-this comparison is
 #:                     placement, with area held fixed. Never deploy it either; it
 #:                     needs the oracle plane twice.
-POOLING_MODES = ("max", "mean", "rms", "max_arearef_rms")
+#:   none              NO POOLING. The plane reaches the model at its native 504x504.
+#:                     Ported from the training worktree 2026-09-04. Everything else
+#:                     pools to the 36x36 token grid at LOAD time, which is where
+#:                     sub-token structure is destroyed -- not in the model.
+#:                     `prepare_data`'s mask assertion checks `(B, V, 1, *, *)` and
+#:                     never the grid, and its upsample is a no-op at native size, so
+#:                     a full-res plane flows through and the patch embed -- a LINEAR
+#:                     map over 196 pixels, not a mean -- can encode within-patch
+#:                     structure. ONLY VALID FOR `mask_in_camera`.
+POOLING_MODES = ("max", "mean", "rms", "max_arearef_rms", "none")
+
+#: DA3 patch size. 504 / 14 = 36 exactly (hard rule 3).
+DA3_PATCH = 14
 
 
 
@@ -408,7 +420,10 @@ class GeoFixPairs(Dataset):
         """
         g = self.token_grid
         if not present:
-            return torch.zeros(self.n_mask, g, g)
+            # Must match the present-case resolution or a batch mixing masked and
+            # unmasked frames cannot be stacked; `none` returns native size.
+            side = g * DA3_PATCH if self.pooling == "none" else g
+            return torch.zeros(self.n_mask, side, side)
         z = np.load(self.artifact_root / split / "masks" / f"{frame}{MASK_SUFFIX}",
                     allow_pickle=True)
         pol = str(z["polarity"])
@@ -419,8 +434,20 @@ class GeoFixPairs(Dataset):
                 "(GeoFix hard rule 7).")
         if self.pooling == "max_arearef_rms":
             return self._mask_arearef(z, g)
-        m = torch.cat([pool_mask(z[t], g, self.pooling) for t in self.mask_types],
-                      dim=0)
+        if self.pooling == "none":
+            # No pooling: hand the plane over at native resolution, still normalised
+            # to float [0,1] exactly as pool_mask does, so gamma and every consumer
+            # downstream behave identically.
+            planes = []
+            for t in self.mask_types:
+                a = z[t]
+                a = a[None] if a.ndim == 2 else a
+                a = torch.from_numpy(np.ascontiguousarray(a)).float()
+                planes.append(a / 255.0 if a.max() > 1.5 else a)
+            m = torch.cat(planes, dim=0)
+        else:
+            m = torch.cat([pool_mask(z[t], g, self.pooling) for t in self.mask_types],
+                          dim=0)
         # Applied to the POOLED mask, matching how session 6.5 measured it.
         # Monotone, so it cannot reorder tokens -- only rescale the area.
         if self.gamma != 1.0:
