@@ -154,7 +154,21 @@ def pool_mask(plane: np.ndarray, grid: int, mode: str = "max") -> torch.Tensor:
     it is exact (14x14 per token, DA3's patch size), and the generality is free.
     """
     a = plane[None] if plane.ndim == 2 else plane
-    t = torch.from_numpy(np.ascontiguousarray(a)).float().div_(255.0)
+    # DTYPE-AWARE, and it must be. Planes are written uint8 [0,255] by every
+    # writer that goes through `masks.common`, but several were appended as
+    # float32 already in [0,1]: blend_a25/50/75, top_oracle, bot_oracle,
+    # oracle_native. Dividing one of those by 255 yields ~0.0006 -- an
+    # EFFECTIVELY EMPTY MASK, with no error raised. Measured 2026-09-06: all
+    # five fidelity arms had run that way and scored identically
+    # (-0.059 +- 0.001, 17/39, LPIPS -0.0106), which reads as "blending buys
+    # nothing" and is really "the mask channel was blank".
+    #
+    # The `pooling == "none"` branch above already used this rule, which is
+    # why oracle_native was unaffected -- so the codebase disagreed with
+    # itself about the convention, in the direction that fails silently.
+    t = torch.from_numpy(np.ascontiguousarray(a)).float()
+    if float(t.max()) > 1.5:
+        t = t.div_(255.0)
     if mode == "none":
         # NATIVE RESOLUTION -- no pooling at all, returns (c, 504, 504) rather
         # than (c, grid, grid). For the sub-token oracle only; see
