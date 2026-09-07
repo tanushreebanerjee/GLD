@@ -95,6 +95,7 @@ def validate_da3_multiview(
     # ------------------------------------------------------------------
     geofix_cond_artifact=False,  # fill cond_channel[:, cond_num:] with render features
     geofix_mask_in_camera=False,  # grade camera channel 0 by M_edit on the target half
+    geofix_mask_in_channels=False,  # the `n_mask` widening: mask as extra INPUT channels
     geofix_clean_target=False,   # supervise/score against gt_clean, not the render
     geofix_bridge_x0=None,       # 'artifact' -> x0 is F_render, not N(0, I)
     geofix_bridge_noise_tau=0.0,  # sigma for the bridge start perturbation
@@ -161,8 +162,8 @@ def validate_da3_multiview(
     # and the trainer cannot drift on WHICH routes consume it.
     geofix_needs_artifact = bool(geofix_cond_artifact or geofix_bridge or geofix_blend_train)
     # Anything that needs the mask. `mask_in_camera` is only one of three.
-    geofix_needs_mask = bool(geofix_mask_in_camera or geofix_bridge_mask_noise
-                             or geofix_blend_train)
+    geofix_needs_mask = bool(geofix_mask_in_camera or geofix_mask_in_channels
+                             or geofix_bridge_mask_noise or geofix_blend_train)
     if geofix_needs_artifact and not geofix_clean_target:
         raise ValueError(
             "a GeoFix route that consumes the render is on but "
@@ -308,9 +309,9 @@ def validate_da3_multiview(
             if 'mask' not in batch:
                 raise ValueError(
                     "a GeoFix route that consumes the mask (mask_in_camera / "
-                    "bridge_mask_noise / blend_train) is on but the batch has no "
-                    "'mask'. Only the GeoFix loader supplies it; check "
-                    "dataset.name=geofix.")
+                    "mask_in_channels / bridge_mask_noise / blend_train) is on but "
+                    "the batch has no 'mask'. Only the GeoFix loader supplies it; "
+                    "check dataset.name=geofix.")
             geofix_mask_tokens = batch['mask'].to(device)
             # Same invariant the training step and `geofix_infer.assert_ref_slots_zero`
             # enforce, and for the same reason: `bridge_mask_noise` builds
@@ -875,6 +876,19 @@ def validate_da3_multiview(
                 geofix_latents_art.reshape(_bv, latent_dim, h_lat, w_lat),
                 geofix_mask_tokens.reshape(_bv, 1, h_lat, w_lat).to(gt_latents.dtype),
             )
+
+        # THE WIDENING ROUTE NEEDS THE MASK AT SAMPLING TIME, not only in the loss.
+        # `m_kwargs_loss` above carries it for the mask-gated loss and is a
+        # different dict; the sampler gets `model_kwargs`, and without this the
+        # widened embedder has no planes and raises. Camera-route arms are
+        # unaffected -- their mask is already inside `camera_embedding`.
+        if geofix_mask_in_channels:
+            if geofix_mask_tokens is None:
+                raise ValueError(
+                    "geofix_mask_in_channels is on but this batch produced no "
+                    "mask; the widened embedder would read latent channels as a "
+                    "mask. Check that the manifest declares the planes.")
+            model_kwargs['geofix_mask_tokens'] = geofix_mask_tokens
 
         with torch.no_grad():
             # Pass model directly (transport now handles positional total_view)

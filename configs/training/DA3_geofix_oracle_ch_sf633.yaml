@@ -1,61 +1,17 @@
-# THE WIDENING ROUTE, and the first arm that needs it: (mu, sigma).
+# THE ORACLE, THROUGH THE WIDENING ROUTE.
 #
-# ## Why this arm exists
+# `oracle_l2` is worth +0.4126 dB through camera channel 0 and the best deployable
+# mask is worth +0.0273. That gap is the project's open problem. This arm asks a
+# question the camera route cannot: is any of the gap the ROUTE rather than the
+# mask? Channel 0 is one of seven plucker channels the camera embedder consumes,
+# so a mask there competes with geometry for the same weights; the widening gives
+# the mask its own input channels on the 1536-dim latent path instead.
 #
-# Every deployable mask this project has trained is a CONDITIONAL MEAN, and it is
-# a well-calibrated one -- std(m)/std(y) divided by corr(m, y) came out 1.006, so
-# the low contrast is optimal L2 behaviour and not a pathology to be tuned away.
-# What a single mean channel cannot say is WHERE IT IS UNSURE. `masknet`'s worst
-# misses are severely damaged but texturally unremarkable regions; its worst false
-# alarms are clean textured ones. Both are places the head would report high
-# variance if anything ever asked it.
-#
-# `run_7465556` (loss: nll, 16,000 steps) emits (mu, log sigma^2) per token. This
-# arm hands GLD BOTH planes and lets it learn how much to trust the first from the
-# second -- which is the one thing a mask cannot express in one channel, and the
-# cheapest remaining idea for closing the oracle/deployable gap (+0.413 vs +0.027 dB).
-#
-# ## Why the WIDENING route rather than camera channel 0
-#
-# The camera route carries exactly one plane: `prepare_data` raises on
-# `m.shape[2] != 1`, by design -- channel 0 IS the mask. Two planes therefore need
-# `stage_2.params.n_mask`, the `2C -> 2C + n_mask` widening that shipped in session
-# 7 and passed its inertness gate bit-identically (max_abs 0.0 over 15,925,248
-# elements). Its data path was finished in `a6a714b` and the train-side flag
-# (`geofix.mask_in_channels`) exists only as of this arm; before it, `n_mask` had
-# no way to be fed and setting it raised inside the model.
-#
-# ## THE CONTROL, and it is not `nomask`
-#
-# Read this arm against `DA3_geofix_mnmu_ch_sf633.yaml`, which is byte-identical
-# except `n_mask: 1` and one fewer plane. Against `nomask` or against the
-# camera-route arms, the route and the planes move together and sigma is not
-# isolated. CLAUDE.md rule 16: the seed floor is 0.0957 dB, so nothing under
-# ~0.10 dB is reportable from a single pair.
-
-# GeoFix -- THE L2-POOLING ARM SET.  pooling=max
-#
-# Three configs, identical except for `dataset.pooling`, over the `oracle_l2`
-# plane:  _max (status quo) / _rms (the experiment) / _arearef (the area control).
-# Read rms MINUS arearef for placement; rms MINUS max confounds placement with
-# area and must not be quoted alone.
-#
-# GeoFix session 8 -- finetune the released level-1 checkpoint to repair 3DGS
-# artifact renders, conditioned on our uncertainty masks.
-#
-# Derived from DA3_level1.yaml. Everything not commented below is unchanged from
-# it on purpose: this is a FINETUNE, and a silently different architecture or
-# transport would make the result incomparable to the released model.
-#
-#   torchrun --standalone --nnodes=1 --nproc_per_node=1 src/train_multiview_da3.py \
-#     --config configs/training/DA3_geofix_level1.yaml \
-#     --data-path assets --results-dir results/geofix/level1 \
-#     --precision bf16 --pretrained <released GLD level-1 ckpt>
-#
-# `--pretrained` (model weights only), NOT `--ckpt` (weights+optimizer+step): we
-# are starting a new run from a released checkpoint, not resuming theirs. Hard
-# rule 2 forbids stage-2 training FROM SCRATCH; finetuning from the release is
-# the plan and always was.
+# Read it against `DA3_geofix_mnmu_ch_sf633.yaml` (same route, deployable mask)
+# for the gap ON this route, and against the camera-route `sf633_lbm_cam_c2` for
+# the route effect on the oracle. The second of those crosses architectures --
+# this set trains on H200, the c2 arms on A6000 -- so it is a direction, not a
+# number, and hard rule 11 says so.
 
 stage_1:
   target: stage1.rae_da3.RAE_DA3
@@ -100,7 +56,7 @@ stage_2:
     # The widening. Zero-init, so step 0 reproduces the released
     # checkpoint exactly (session-7 inertness gate). Must equal
     # len(dataset.mask_types); the trainer checks all three.
-    n_mask: 2
+    n_mask: 1
     predict_cls: false
     is_concat_mode: true
 
@@ -141,7 +97,7 @@ geofix:
   # construction rather than by a correction. CFG preserves it: the uncond branch
   # zeroes camera channels 1: and keeps 0.
   mask_in_camera: false      # the widening carries the mask, not camera ch 0
-  mask_in_channels: true     # binds geofix_mask_tokens; needs n_mask == 2
+  mask_in_channels: true     # binds geofix_mask_tokens; needs n_mask == 1
 
   # ------------------------------------------------------------------------
   # What the flow is supervised TOWARD. `gt_inp` from the GeoFix loader is the
@@ -305,13 +261,13 @@ dataset:
   name: geofix
 
   # Absolute: training runs from the GLD fork worktree, not from geofix/.
-  manifest: /fs/nexus-projects/Generative_Detection/workspace/research/uncertainty-guided-diffusion/geofix/eval/train/manifest_syncfix_train_nllmusig.json
+  manifest: /fs/nexus-projects/Generative_Detection/workspace/research/uncertainty-guided-diffusion/geofix/eval/train/manifest_syncfix_train_l2.json
   # The frozen holdout, it_03000 only. Shares 0 splits AND 0 (level, scene, run)
   # reconstructions with the training manifest.
-  val_manifest: /fs/nexus-projects/Generative_Detection/workspace/research/uncertainty-guided-diffusion/geofix/eval/train/manifest_holdout2_it03000_nllmusig.json
+  val_manifest: /fs/nexus-projects/Generative_Detection/workspace/research/uncertainty-guided-diffusion/geofix/eval/train/manifest_holdout_it03000_l2.json
 
   # Mask planes stacked in order; must match what the manifest recorded.
-  mask_types: [masknet_nll_mu, masknet_nll_sigma]
+  mask_types: [oracle_l2]
   token_grid: 36
   # Contrast exponent on the POOLED mask. 1.0 = untouched. The blend's optimum
   # was a mask AREA of ~0.45. The numbers this comment used to carry --

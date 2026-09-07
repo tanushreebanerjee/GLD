@@ -418,9 +418,26 @@ class Transport:
         xt_flat = xt  # already flat
         
         # Minkyung debugging: Remove duplicate 'total_view' from model_kwargs
-        # 'geofix_mask_tokens' is loss-side only and must never reach the model.
-        _drop_kwargs = ('total_view', 'geofix_mask_tokens', 'geofix_blend_tokens',
-                        'geofix_blend_toward', 'geofix_loss_keep_weight')
+        # 'geofix_mask_tokens' is loss-side only for the CAMERA route -- there the
+        # mask reaches the network as camera channel 0 and this copy exists purely
+        # so the loss can be split by it, so passing it on would be an unexpected
+        # kwarg. Under the WIDENING route (`n_mask > 0`) the same tensor is the
+        # model's INPUT: `DDT.forward` reads it and `_append_geofix_mask` puts it
+        # in as the last channels. Dropping it there raised
+        #   "n_mask=1 but no `geofix_mask_tokens` was passed"
+        # at the first batch -- the last of the four places the widening was wired
+        # on one side only, and the only one that is not in `train_multiview_da3`.
+        #
+        # Keyed off the MODEL rather than off a flag, because the model is the
+        # thing that either has the channels or does not, and `n_mask` is read
+        # from the same attribute the forward guard uses. Unwrap DDP first: the
+        # attribute lives on the wrapped module.
+        _core = getattr(model, 'module', model)
+        _model_reads_mask = int(getattr(_core, 'n_mask', 0)) > 0
+        _drop_kwargs = ['total_view', 'geofix_blend_tokens',
+                        'geofix_blend_toward', 'geofix_loss_keep_weight']
+        if not _model_reads_mask:
+            _drop_kwargs.append('geofix_mask_tokens')
         if any(k in model_kwargs for k in _drop_kwargs):
             model_kwargs = {k: v for k, v in model_kwargs.items() if k not in _drop_kwargs}
         

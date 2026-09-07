@@ -277,13 +277,13 @@ dataset:
   name: geofix
 
   # Absolute: training runs from the GLD fork worktree, not from geofix/.
-  manifest: /fs/nexus-projects/Generative_Detection/workspace/research/uncertainty-guided-diffusion/geofix/eval/train/manifest_syncfix_train_mnmu.json
+  manifest: /fs/nexus-projects/Generative_Detection/workspace/research/uncertainty-guided-diffusion/geofix/eval/train/manifest_syncfix_train_nllmusig.json
   # The frozen holdout, it_03000 only. Shares 0 splits AND 0 (level, scene, run)
   # reconstructions with the training manifest.
-  val_manifest: /fs/nexus-projects/Generative_Detection/workspace/research/uncertainty-guided-diffusion/geofix/eval/train/manifest_holdout2_it03000_mnmu.json
+  val_manifest: /fs/nexus-projects/Generative_Detection/workspace/research/uncertainty-guided-diffusion/geofix/eval/train/manifest_holdout2_it03000_nllmusig.json
 
   # Mask planes stacked in order; must match what the manifest recorded.
-  mask_types: [mnmu]
+  mask_types: [masknet_nll_mu]
   token_grid: 36
   # Contrast exponent on the POOLED mask. 1.0 = untouched. The blend's optimum
   # was a mask AREA of ~0.45. The numbers this comment used to carry --

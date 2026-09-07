@@ -559,17 +559,44 @@ class DiTwDDTHead(nn.Module):
         shapes still match, and the output is garbage that reads as
         "conditioning hurt".
 
-            x   (BV, C_in, K+N, 1)   K leading special/register tokens, N patches
-            mt  (B, V, n_mask, h, w) with h*w == N
-            ->  (BV, C_in + n_mask, K+N, 1), mask channels LAST, zeros over the
-                K special positions (they are not patches and have no mask).
+            packed   x (BV, C_in, K+N, 1)   K leading special/register tokens
+                     mt (B, V, n_mask, h, w) with h*w == N
+                     -> (BV, C_in + n_mask, K+N, 1), mask channels LAST, zeros
+                        over the K special positions (not patches, no mask).
+            spatial  x (BV, C_in, h, w)      `stage_1.reshape_to_2d: true`
+                     mt (B, V, n_mask, h, w) matching grid, asserted
+                     -> (BV, C_in + n_mask, h, w), mask channels LAST.
         """
         if mt is None:
             raise ValueError(
                 f"n_mask={self.n_mask} but no `geofix_mask_tokens` was passed. The "
                 "widened embedder would read latent channels as a mask.")
+        # TWO LAYOUTS, and this hook has to serve both. `stage_1.reshape_to_2d`
+        # decides which: with it on, `x` is (BV, C_in, h, w) -- a plain feature
+        # map, no special tokens -- and with it off, (BV, C_in, K+N, 1), N patches
+        # behind K leading register/camera tokens. Every shipped GeoFix config
+        # sets `reshape_to_2d: true`, so the SPATIAL case is the common one; it
+        # was the packed case that got written first, because the packed one is
+        # where the K-token padding is subtle and needed the comment.
+        #
+        # Spatial is the easy branch and it is still asserted rather than assumed:
+        # the mask grid must match x's grid exactly, or a silently broadcast or
+        # interpolated mask would attach damage to the wrong tokens.
+        if x.ndim == 4 and x.shape[-1] != 1 and x.shape[-1] == x.shape[-2]:
+            BV = x.shape[0]
+            m = mt.reshape(-1, *mt.shape[-3:])                # (BV, n_mask, h, w)
+            if m.shape[0] != BV:
+                raise ValueError(f"mask batch {m.shape[0]} vs x {BV}")
+            if m.shape[1] != self.n_mask:
+                raise ValueError(f"mask has {m.shape[1]} planes, n_mask={self.n_mask}")
+            if m.shape[-2:] != x.shape[-2:]:
+                raise ValueError(
+                    f"mask grid {tuple(m.shape[-2:])} != feature grid "
+                    f"{tuple(x.shape[-2:])}; the mask is pooled to the token grid "
+                    "by GeoFixPairs and must arrive at exactly that size.")
+            return torch.cat([x, m.to(x.dtype)], dim=1)
         if x.ndim != 4 or x.shape[-1] != 1:
-            raise ValueError(f"expected x (BV, C, T, 1), got {tuple(x.shape)}")
+            raise ValueError(f"expected x (BV, C, T, 1) or (BV, C, h, w), got {tuple(x.shape)}")
         BV, C_in, T, _ = x.shape
         m = mt.reshape(-1, *mt.shape[-3:])                    # (BV, n_mask, h, w)
         if m.shape[0] != BV:
@@ -988,6 +1015,25 @@ class DiTwDDTHead(nn.Module):
                 uncond_source_cond = source_cond
             
             cfg_kwargs['source_condition'] = torch.cat([source_cond, uncond_source_cond], dim=0)
+
+        # 4. Handle the GeoFix mask planes for CFG (the `n_mask` widening).
+        #
+        # `combined_x` is [cond | uncond] along dim 0, so every conditioning
+        # tensor must be doubled the same way or `_append_geofix_mask` raises
+        # "mask batch BV vs x 2BV" -- which is what it did the first time the
+        # widening reached a CFG sampler.
+        #
+        # THE MASK IS KEPT IN THE UNCONDITIONAL HALF, not dropped or noised.
+        # That matches the camera route, where channel 0 carries M_edit and is
+        # preserved by CFG while the POSE channels are dropped
+        # (`uncond_camera_embedding`) -- the mask says WHERE to repair, and a
+        # guidance direction computed between "repair here" and "repair nowhere"
+        # would turn the mask into the guided axis rather than a condition on it.
+        # Keeping it makes CFG guide appearance under a fixed mask, which is the
+        # semantics every mask arm in this project has been scored under.
+        if cfg_kwargs.get('geofix_mask_tokens', None) is not None:
+            _mt = cfg_kwargs['geofix_mask_tokens']
+            cfg_kwargs['geofix_mask_tokens'] = torch.cat([_mt, _mt], dim=0)
 
         # Forward pass for both cond and uncond batches
         model_out = self.forward(combined_x, combined_t, total_view, combined_camera, **cfg_kwargs)

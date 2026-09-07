@@ -1204,6 +1204,22 @@ def main(args):
         }
         for k in state_dict:
             state_dict[k] = state_dict[k].to(torch.bfloat16)
+        # THE WIDENING'S OTHER HALF. `n_mask > 0` builds embedders of width
+        # `2C + n_mask`; every checkpoint worth warm-starting from was trained at
+        # `2C`. `load_state_dict` accumulates a size mismatch into `error_msgs`
+        # and raises it even under `strict=False`, so without this the widening
+        # route could only ever train from scratch -- which is why
+        # `expand_state_dict` had existed since session 7 with its only caller a
+        # gate script (`geofix_pairs.py:595` names the gap).
+        #
+        # The pad goes at the END of the input-channel dim, matching
+        # `[condition | noisy | mask]`, and it is ZERO, so the widened model at
+        # step 0 computes exactly what the narrow one did. That is the session-7
+        # inertness gate's claim, and it is what makes an arm's mask effect
+        # attributable to the mask rather than to the surgery.
+        if int(getattr(model, "n_mask", 0)) > 0:
+            from stage2.models import mask_conditioning as _mc
+            state_dict = _mc.expand_state_dict(state_dict, model)
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
         # A finetune that silently loaded nothing is a from-scratch run wearing a
         # finetune's name, which hard rule 2 exists to prevent. `strict=False` is
@@ -1219,10 +1235,20 @@ def main(args):
     if args.ckpt is not None:
         checkpoint = torch.load(args.ckpt, map_location="cpu")
         ckpt_meta = checkpoint
+        # Same widening as the `--pretrained` path above. A requeue of a widened
+        # arm resumes from its OWN checkpoint, which is already wide and passes
+        # through `expand_state_dict` untouched; this matters for the other case,
+        # warm-starting a widened arm from a narrow arm's `--ckpt` to inherit its
+        # optimiser state as well as its weights.
+        _widen = int(getattr(model, "n_mask", 0)) > 0
+        if _widen:
+            from stage2.models import mask_conditioning as _mc
         if "model" in checkpoint:
-            model.load_state_dict(checkpoint["model"])
+            _sd = checkpoint["model"]
+            model.load_state_dict(_mc.expand_state_dict(_sd, model) if _widen else _sd)
         if "ema" in checkpoint:
-            ema.load_state_dict(checkpoint["ema"])
+            _sd = checkpoint["ema"]
+            ema.load_state_dict(_mc.expand_state_dict(_sd, ema) if _widen else _sd)
         opt_state = checkpoint.get("opt")
         # A STRIPPED CHECKPOINT MUST NOT RESUME SILENTLY. `opt` is half of an
         # 11.7 GB checkpoint (5.84 GB of it), so `slurm/ckpt_strip_opt.py` drops
@@ -2588,6 +2614,7 @@ def main(args):
                     # RENDER rather than the clean frame. Finite, plotted, wrong.
                     geofix_cond_artifact=geofix_cond_artifact,
                     geofix_mask_in_camera=geofix_mask_in_camera,
+                    geofix_mask_in_channels=geofix_mask_in_channels,
                     # ADDED 2026-08-27. The two above were the only ones passed,
                     # and the trainer supports five more routes. The two measured
                     # consequences: a bridge arm was validated FROM A NOISE START
