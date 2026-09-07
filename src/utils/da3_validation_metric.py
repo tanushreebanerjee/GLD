@@ -144,6 +144,14 @@ def get_denoised_features(
     # conditioning and they have to agree exactly.
     geofix_artifact_images=None,  # (B, V, 3, H, W) 3DGS renders -> condition slot
     geofix_mask=None,             # (B, V, 1, g, g) M_edit on the token grid
+    # THE WIDENING ROUTE at sampling time. `geofix_mask` above is graded into
+    # camera channel 0 and is limited to ONE plane; this one is handed to the model
+    # as extra INPUT channels (`stage_2.params.n_mask`) and may carry several --
+    # the first arm to use it pairs a predicted mask with its predicted sigma.
+    # Kept separate rather than overloaded, exactly as `cfg_mask_plane` is, because
+    # routing two mask consumers through one argument is what cost the 2026-08-31
+    # run 4.5 dB to a train/test mismatch.
+    geofix_mask_tokens=None,      # (B, V, n_mask, g, g) on the token grid
     # LATENT BRIDGE MATCHING. A bridge-trained checkpoint MUST be sampled from the
     # artifact features, not from noise: it never learned a velocity field out of
     # N(0, I). Scoring one on the stock noise start does not error, it just returns
@@ -376,6 +384,20 @@ def get_denoised_features(
         model_kwargs['is_concat_mode'] = True
         model_kwargs['ref_cond'] = latents_cond
     
+    # THE WIDENING'S SAMPLING SIDE. `DDT.forward` appends these as the last
+    # `n_mask` input channels and RAISES if they are absent, so a widened
+    # checkpoint scored without them cannot silently produce a mask-free arm
+    # under a mask arm's name -- it fails instead. Keyed off the model, which is
+    # the thing that either has the channels or does not.
+    _core = getattr(model, 'module', model)
+    if int(getattr(_core, 'n_mask', 0)) > 0:
+        if geofix_mask_tokens is None:
+            raise ValueError(
+                f"the model was built with n_mask={int(getattr(_core, 'n_mask', 0))} "
+                "but no geofix_mask_tokens reached sampling. The widened embedder "
+                "would read latent channels as a mask. Pass the manifest's planes.")
+        model_kwargs['geofix_mask_tokens'] = geofix_mask_tokens.to(device)
+
     # ========== 4. Diffusion Sampling ==========
     with torch.no_grad():
         samples = sampler(sample_input_flat, model, **model_kwargs)[-1]

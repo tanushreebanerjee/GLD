@@ -406,8 +406,28 @@ class GeoFixPairs(Dataset):
 
     @property
     def n_mask(self) -> int:
-        """Channels the mask occupies. Must equal the model's `n_mask`."""
-        return int(self.m["n_mask"])
+        """Channels the mask occupies: `len(mask_types)`, the planes ACTUALLY stacked.
+
+        THIS USED TO READ `self.m["n_mask"]`, THE MANIFEST'S DECLARED COUNT, and
+        the two are not the same number whenever a config asks for a SUBSET of
+        what the manifest offers -- which `__init__` explicitly permits (it
+        refuses only planes the manifest lacks). The `(mu, sigma)` pair made that
+        legal case real: one manifest declares both planes, the two-plane arm
+        takes both and the one-plane control takes `mu` alone.
+
+        The failure was as split as it gets. `_mask` stacks `self.mask_types`, so
+        a frame WITH a mask returned 1 plane; the two zero-fill paths below use
+        `self.n_mask`, so a frame WITHOUT one returned 2. Both are silent until
+        the collate stacks a batch that happens to contain one of each:
+
+            stack expects each tensor to be equal size, but got
+            [1, 2, 36, 36] at entry 0 and [1, 1, 36, 36] at entry 4
+
+        -- a shape error four frames into a batch, naming neither the manifest
+        nor the config. Deriving the count from the same list `_mask` iterates
+        makes the two paths the same number by construction.
+        """
+        return len(self.mask_types)
 
     @property
     def mask_side(self) -> int:

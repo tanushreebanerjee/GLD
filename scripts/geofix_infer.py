@@ -916,6 +916,28 @@ def main() -> int:
         pooling=pooling,
         return_gt=True,
     )
+    # THE WIDENING ROUTE, read off the MODEL rather than off a flag. A checkpoint
+    # trained with `stage_2.params.n_mask > 0` carries embedders of width
+    # `2C + n_mask`, and `DDT.forward` refuses to run without the planes -- so
+    # there is nothing to configure here and nothing that can disagree. Asserted
+    # against the manifest immediately, because the two numbers ARE the same
+    # number written twice and the failure is otherwise a shape error deep inside
+    # the first forward.
+    _core = getattr(ctx["model1"], "module", ctx["model1"])
+    _model_n_mask = int(getattr(_core, "n_mask", 0) or 0)
+    if _model_n_mask > 0:
+        _declared = len(dataset.mask_types)
+        if _declared != _model_n_mask:
+            raise SystemExit(
+                f"the checkpoint's model has n_mask={_model_n_mask} but "
+                f"{pathlib.Path(args.manifest).name} stacks {_declared} plane(s) "
+                f"({list(dataset.mask_types)}). GeoFixPairs concatenates them in "
+                "order and the model appends exactly n_mask of them, so these "
+                "must match; scoring a widened arm on the wrong plane count is "
+                "not something any downstream number would reveal.")
+        print(f"[infer] widening route: n_mask={_model_n_mask}, "
+              f"planes={list(dataset.mask_types)}", flush=True)
+
     n = len(dataset) if args.limit is None else min(args.limit, len(dataset))
     # Sharding, and the GLOBAL index is what survives it. `indices` holds the real
     # dataset positions, so the per-sample seed below stays `seed + global_i` and a
@@ -1120,6 +1142,13 @@ def main() -> int:
                 "The guidance weight is built from the mask; without one the arm would "
                 "run as an unmodulated no-op wearing a mechanism's name.")
         msk = msk_any if args.mask_in_camera else None
+        # THE WIDENING ROUTE takes the manifest's planes UNREDUCED. `msk_any` is
+        # gated on the camera flags and is asserted single-plane above, so it is
+        # the wrong tensor here: a two-plane arm needs both. Read `batch["mask"]`
+        # directly and let `DDT._append_geofix_mask` check the count against the
+        # model's `n_mask` -- that assertion is at the point of use and is the one
+        # that matters.
+        msk_ch = batch["mask"] if _model_n_mask > 0 else None
         msk_l0 = msk_any if args.mask_in_camera_l0 else None
 
         feat, feat_denorm = {}, {}
@@ -1166,6 +1195,7 @@ def main() -> int:
             cfg_mask_plane=(msk_any if ctx["cfg_mask_mode"] != "none" else None),
             cfg_uncond_mode=ctx["cfg_uncond_mode"], batch=geo_batch,
             geofix_artifact_images=art, geofix_mask=msk,
+            geofix_mask_tokens=msk_ch,
             # A bridge-trained checkpoint has to be SAMPLED as a bridge. These
             # must match the flags the checkpoint was trained with; there is no
             # way to read them off the .pt, so they are stated on the command
