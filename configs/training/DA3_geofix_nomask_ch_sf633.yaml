@@ -1,17 +1,41 @@
-# THE ORACLE, THROUGH THE WIDENING ROUTE.
+# THE NO-MASK CONTROL for the four-arm widening set.
 #
-# `oracle_l2` is worth +0.4126 dB through camera channel 0 and the best deployable
-# mask is worth +0.0273. That gap is the project's open problem. This arm asks a
-# question the camera route cannot: is any of the gap the ROUTE rather than the
-# mask? Channel 0 is one of seven plucker channels the camera embedder consumes,
-# so a mask there competes with geometry for the same weights; the widening gives
-# the mask its own input channels on the 1536-dim latent path instead.
+# A COPY of `DA3_geofix_l2pool_max.yaml` rather than that file plus
+# `--geofix-no-mask`, for one reason: this set's four arms must validate on ONE
+# population or their val curves cannot be read against each other, and
+# `l2pool_max`'s val manifest is the 194-sample DL3DV `holdout` while the
+# (mu, sigma) arms must use `holdout2` -- the only population carrying their
+# planes. Editing `l2pool_max` in place would have reached the c2 arms still
+# running off it.
 #
-# Read it against `DA3_geofix_mnmu_ch_sf633.yaml` (same route, deployable mask)
-# for the gap ON this route, and against the camera-route `sf633_lbm_cam_c2` for
-# the route effect on the oracle. The second of those crosses architectures --
-# this set trains on H200, the c2 arms on A6000 -- so it is a direction, not a
-# number, and hard rule 11 says so.
+# `mask_in_camera` is left TRUE here and turned off at the command line with
+# `--geofix-no-mask`, which is the contract that flag documents: it refuses a
+# config where the mask is already off, so that "the ablation arm ran the mask-ON
+# config with the mask removed" stays checkable from the launch line.
+
+# GeoFix -- THE L2-POOLING ARM SET.  pooling=max
+#
+# Three configs, identical except for `dataset.pooling`, over the `oracle_l2`
+# plane:  _max (status quo) / _rms (the experiment) / _arearef (the area control).
+# Read rms MINUS arearef for placement; rms MINUS max confounds placement with
+# area and must not be quoted alone.
+#
+# GeoFix session 8 -- finetune the released level-1 checkpoint to repair 3DGS
+# artifact renders, conditioned on our uncertainty masks.
+#
+# Derived from DA3_level1.yaml. Everything not commented below is unchanged from
+# it on purpose: this is a FINETUNE, and a silently different architecture or
+# transport would make the result incomparable to the released model.
+#
+#   torchrun --standalone --nnodes=1 --nproc_per_node=1 src/train_multiview_da3.py \
+#     --config configs/training/DA3_geofix_level1.yaml \
+#     --data-path assets --results-dir results/geofix/level1 \
+#     --precision bf16 --pretrained <released GLD level-1 ckpt>
+#
+# `--pretrained` (model weights only), NOT `--ckpt` (weights+optimizer+step): we
+# are starting a new run from a released checkpoint, not resuming theirs. Hard
+# rule 2 forbids stage-2 training FROM SCRATCH; finetuning from the release is
+# the plan and always was.
 
 stage_1:
   target: stage1.rae_da3.RAE_DA3
@@ -53,10 +77,6 @@ stage_2:
     cam_input_size: 504
     cam_patch_size: 14
     level: 1
-    # The widening. Zero-init, so step 0 reproduces the released
-    # checkpoint exactly (session-7 inertness gate). Must equal
-    # len(dataset.mask_types); the trainer checks all three.
-    n_mask: 1
     predict_cls: false
     is_concat_mode: true
 
@@ -64,24 +84,17 @@ stage_2:
 # GeoFix conditioning -- the two slots that already exist at the right shape
 # (docs/ARCH_NOTES.md, "two conditioning slots that need no widening").
 #
-# INHERITED FROM THE CAMERA-ROUTE CONFIG THIS WAS COPIED FROM, AND CORRECTED:
-# the ladder below is written in `mask_in_camera`, which is FALSE here. This arm
-# is `cond_artifact=T` with the mask arriving through `mask_in_channels` instead,
-# so it sits on the third row by MEANING and on the second by that column.
+# Neither needs the `2C -> 2C + n_mask` embedder widening, so neither can be
+# confounded with "my channel surgery perturbed a 175k-iteration checkpoint".
+# The ablation ladder is exactly these two booleans over one code path.
 #
-#   cond_artifact=F mask=F   stock GLD -- pure generation, the MECHANISM
-#                            baseline (6.5's "arm A")
-#   cond_artifact=T mask=F   refinement WITHOUT the mask; the honest baseline
-#                            for "does the mask add anything"
-#   cond_artifact=T mask=T   GeoFix proper                          <- this file
-#   cond_artifact=F mask=T   mask with nothing to preserve; diagnostic only,
-#                            see the note in prepare_data
-#
-# The widening DOES touch the embedder, so unlike the camera route this arm could
-# in principle be confounded with the channel surgery. It is not: the added
-# channels are zero-init and the session-7 inertness gate measured the untrained
-# widened model bit-identical to the released one (max_abs 0.0, 0 of 15,925,248
-# elements). The one-plane/two-plane pair shares the surgery besides.
+#   cond_artifact=F mask_in_camera=F   stock GLD -- pure generation, the
+#                                      MECHANISM baseline (6.5's "arm A")
+#   cond_artifact=T mask_in_camera=F   refinement WITHOUT the mask; the honest
+#                                      baseline for "does the mask add anything"
+#   cond_artifact=T mask_in_camera=T   GeoFix proper                <- this file
+#   cond_artifact=F mask_in_camera=T   mask with nothing to preserve; diagnostic
+#                                      only, see the note in prepare_data
 # =============================================================================
 geofix:
   # Fill latents_cond[:, cond_num:] -- which stock GLD leaves as ZEROS -- with
@@ -96,8 +109,7 @@ geofix:
   # mask in the project that enters with NO sign flip -- hard rule 7 satisfied by
   # construction rather than by a correction. CFG preserves it: the uncond branch
   # zeroes camera channels 1: and keeps 0.
-  mask_in_camera: false      # the widening carries the mask, not camera ch 0
-  mask_in_channels: true     # binds geofix_mask_tokens; needs n_mask == 1
+  mask_in_camera: true
 
   # ------------------------------------------------------------------------
   # What the flow is supervised TOWARD. `gt_inp` from the GeoFix loader is the

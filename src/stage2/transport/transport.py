@@ -588,6 +588,17 @@ class Transport:
             # ----------------------------------------------------------------
             if geofix_mask_tokens is not None:
                 m = geofix_mask_tokens
+                # THE LOSS SPLIT IS A PLACEMENT QUESTION, so it takes plane 0 and
+                # only plane 0. Under the `n_mask` widening the mask may carry
+                # several planes -- the first arm to do so pairs a predicted mask
+                # with its predicted SIGMA -- and only the first is an `edit1`
+                # statement about where to repair. Weighting the loss by an
+                # uncertainty channel would mean "supervise hardest where the
+                # mask head is least sure", which is not a thing anyone asked
+                # for. Plane 0 is the placement plane by the same convention
+                # `mask_types` is ordered in and `mask_in_camera` grades on.
+                if m.ndim == 5 and m.shape[2] > 1:
+                    m = m[:, :, :1]
                 expected = (B, total_view, 1) + tuple(diff_sq.shape[3:])
                 if tuple(m.shape) != expected:
                     raise ValueError(
