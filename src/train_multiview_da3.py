@@ -605,6 +605,19 @@ def main(args):
     geofix_cfg = cfg.get("geofix", {}) or {}
     geofix_cond_artifact = bool(geofix_cfg.get("cond_artifact", False))
     geofix_mask_in_camera = bool(geofix_cfg.get("mask_in_camera", False))
+    # THE WIDENING ROUTE (`2C -> 2C + n_mask`), which until now had a model but no
+    # data path. `stage_2.params.n_mask` widens the embedder and
+    # `DDT._append_geofix_mask` appends the planes -- but `geofix_mask_tokens` was
+    # bound only by the four consumers below, none of which is the widening, so a
+    # config that set `n_mask` and nothing else raised inside the model. That is
+    # CLAUDE.md rule 14's exact shape: a knob recorded and wired on one side only.
+    #
+    # It is a SEPARATE flag from `mask_in_camera` rather than an alias, because the
+    # camera route is hard-limited to ONE plane (`prepare_data` raises on
+    # `m.shape[2] != 1`) and the whole reason to widen is to carry MORE than one --
+    # the (mu, sigma) arm being the first. Turning both on is legal and means the
+    # first plane also grades camera channel 0; that is a third arm, not a default.
+    geofix_mask_in_channels = bool(geofix_cfg.get("mask_in_channels", False))
     # The ablation arm runs off the SAME config file with this flag, rather than a
     # second copy of it. Two files would let anything else drift between the arms,
     # and the one comparison that isolates the mask from the render is worthless if
@@ -770,6 +783,7 @@ def main(args):
     # ------------------------------------------------------------------
     _mask_consumers = [n for n, on in (
         ("geofix.mask_in_camera", geofix_mask_in_camera),
+        ("geofix.mask_in_channels", geofix_mask_in_channels),
         ("geofix.bridge_mask_noise", geofix_bridge_mask_noise),
         ("geofix.blend_train", geofix_blend_train),
         ("geofix.loss_keep_weight", geofix_loss_keep_weight != 0.0),
@@ -853,11 +867,54 @@ def main(args):
             "would condition the model on the render AND supervise it toward the "
             "render, i.e. train an identity map that scores like the input.")
 
-    if (geofix_cond_artifact or geofix_mask_in_camera or geofix_bridge
-            or geofix_clean_target) and dataset_name.lower() != "geofix":
+    if (geofix_cond_artifact or geofix_mask_in_camera or geofix_mask_in_channels
+            or geofix_bridge or geofix_clean_target) and dataset_name.lower() != "geofix":
         raise ValueError(
             f"geofix.* conditioning is on but dataset.name={dataset_name!r}. "
             "Only the GeoFix loader supplies 'gt_clean' and 'mask'.")
+
+    # ------------------------------------------------------------------
+    # `mask_in_channels` AND `n_mask` MUST AGREE, AND BOTH MUST MATCH THE PLANES.
+    #
+    # Three values have to line up for the widening route to carry anything:
+    # the flag (this file), `stage_2.params.n_mask` (the embedder width) and the
+    # length of the manifest's `mask_types` (what the loader stacks). Any pair
+    # can agree while the third differs, and only ONE of the three mismatches is
+    # loud on its own -- `_append_geofix_mask` raises when the plane count and
+    # `n_mask` disagree. The other two are silent:
+    #
+    #   flag on,  n_mask 0  -> forward never appends; the arm is a no-mask run
+    #                          wearing a mask config, which is the defect class
+    #                          CLAUDE.md rule 14 has now seen six times.
+    #   flag off, n_mask >0 -> the model raises, but only once a batch reaches it,
+    #                          i.e. after the checkpoint load and the first encode.
+    #
+    # So check all three HERE, before a GPU-minute is spent.
+    # ------------------------------------------------------------------
+    _n_mask = int(((model_config or {}).get("params", {}) or {}).get("n_mask", 0) or 0)
+    if geofix_mask_in_channels and _n_mask <= 0:
+        raise ValueError(
+            "geofix.mask_in_channels is on but stage_2.params.n_mask is "
+            f"{_n_mask}. The embedder was never widened, so DDT.forward's "
+            "`n_mask > 0` branch never fires and the mask planes are loaded, "
+            "pooled and then dropped -- an arm identical to --geofix-no-mask "
+            "but recorded in its provenance as mask-conditioned.")
+    if _n_mask > 0 and not geofix_mask_in_channels:
+        raise ValueError(
+            f"stage_2.params.n_mask={_n_mask} but geofix.mask_in_channels is off. "
+            "Nothing would bind `geofix_mask_tokens`, and the widened embedder "
+            "would read latent channels as a mask.")
+    if geofix_mask_in_channels:
+        _mt = list((dataset_config or {}).get("mask_types") or [])
+        if not _mt:
+            _mp = (dataset_config or {}).get("manifest")
+            if _mp and Path(_mp).is_file():
+                _mt = list(json.loads(Path(_mp).read_text()).get("mask_types") or [])
+        if _mt and len(_mt) != _n_mask:
+            raise ValueError(
+                f"n_mask={_n_mask} but the planes to stack are {_mt} "
+                f"({len(_mt)} of them). GeoFixPairs concatenates them in order, "
+                "so these two numbers ARE the same number written twice.")
     # All datasets must provide OpenCV c2w at load time
     # Feature-to-Feature Flow Matching: Optional source level conditioning
     # source_level: If set, use features from this level (+ noise) as x0 instead of pure noise
@@ -1043,6 +1100,7 @@ def main(args):
     geofix_settings = {
         "cond_artifact": bool(geofix_cond_artifact),
         "mask_in_camera": bool(geofix_mask_in_camera),
+        "mask_in_channels": bool(geofix_mask_in_channels),
         "clean_target": bool(geofix_clean_target),
         # The string, not the derived bool: 'artifact' / None. `geofix_bridge` is
         # `== "artifact"`, so the string is the strictly more informative of the
@@ -1656,7 +1714,8 @@ def main(args):
             # on, so it is bound separately -- the 2x2 of {input, start-noise} only
             # exists if those two are independently controllable.
             geofix_mask_tokens = None
-            if (geofix_mask_in_camera or geofix_bridge_mask_noise or geofix_blend_train
+            if (geofix_mask_in_camera or geofix_mask_in_channels
+                    or geofix_bridge_mask_noise or geofix_blend_train
                     or geofix_loss_keep_weight != 0.0):
                 if 'mask' not in batch:
                     raise ValueError(
