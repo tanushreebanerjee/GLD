@@ -1372,6 +1372,15 @@ def main() -> int:
         "bridge_mask_noise": bool(args.bridge_mask_noise),
         "cond_artifact": bool(args.cond_artifact),
         "mask_in_camera": bool(args.mask_in_camera),
+        # THE WIDENING ROUTE, recorded in the same change that adds the knob
+        # (hard rule 14). Without it, a `bridge` arm sampled through camera
+        # channel 0 and a `bridge` arm sampled through n_mask input channels
+        # write BYTE-IDENTICAL provenance -- and "the ablation's two arms look
+        # identical in provenance" is the symptom this project has now seen
+        # seven times. Read off the model, not off a flag, because the model is
+        # what has the channels.
+        "n_mask": _model_n_mask,
+        "mask_types": list(dataset.mask_types),
         # LEVEL 0. Recorded unconditionally, including the False/False default,
         # so that an arm directory can be told apart from one written before
         # these flags existed by the PRESENCE of the keys rather than by their
