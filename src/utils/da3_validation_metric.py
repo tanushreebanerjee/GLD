@@ -152,6 +152,16 @@ def get_denoised_features(
     # routing two mask consumers through one argument is what cost the 2026-08-31
     # run 4.5 dB to a train/test mismatch.
     geofix_mask_tokens=None,      # (B, V, n_mask, g, g) on the token grid
+    # Zero-shot velocity mask: one forward at `velocity_t`, no sampling. See 4a.
+    velocity_only=False,
+    # t = 1.0 IS THE ARTIFACT END, and this is the opposite of the usual
+    # flow-matching convention. `integrators.py` sets `self.t = 1 - linspace(t0,t1)`,
+    # so sampling runs t: 1 -> 0 and the SAMPLING START -- which under
+    # `bridge_x0: artifact` is the artifact latent -- sits at t = 1. Defaulting to
+    # 0.0 would have measured the velocity at the CLEAN end: a different quantity
+    # that still yields a plausible-looking map, which is exactly why the default
+    # is pinned here with the derivation rather than left to the caller.
+    velocity_t=1.0,
     # LATENT BRIDGE MATCHING. A bridge-trained checkpoint MUST be sampled from the
     # artifact features, not from noise: it never learned a velocity field out of
     # N(0, I). Scoring one on the stock noise start does not error, it just returns
@@ -397,6 +407,39 @@ def get_denoised_features(
                 "but no geofix_mask_tokens reached sampling. The widened embedder "
                 "would read latent channels as a mask. Pass the manifest's planes.")
         model_kwargs['geofix_mask_tokens'] = geofix_mask_tokens.to(device)
+
+    # ========== 4a. VELOCITY MASK (zero-shot, no sampling) ==========
+    #
+    # THE BRIDGE'S OWN DAMAGE ESTIMATE. This model is trained with
+    # `bridge_x0: artifact` -- x0 IS the artifact features and x1 is clean -- so the
+    # velocity field it predicts at the artifact end is not a proxy for damage, it
+    # is the transport's own estimate of how far each token must move to become
+    # clean. ||v(x0, t~0)|| per token is therefore a damage map by construction,
+    # and it needs NO TRAINED HEAD: every deployable mask so far required one, and
+    # eight of them land inside a 0.016 rho band.
+    #
+    # CFG IS STRIPPED. `forward_with_cfg` returns a GUIDED velocity, which is a
+    # weighted difference of two forwards and not the model's own estimate of
+    # anything; it also doubles the batch. What is wanted here is the raw
+    # conditional velocity.
+    #
+    # t is taken at the ARTIFACT end. The transport's convention is checked rather
+    # than assumed by the caller passing `velocity_t` explicitly -- getting this
+    # backwards would measure the distance from the CLEAN end, which is a different
+    # quantity that would still produce a plausible-looking map.
+    if velocity_only:
+        vk = {k: v for k, v in model_kwargs.items()
+              if k not in ("cfg_scale", "pag_scale", "pag_layer_idx",
+                           "cfg_mask_mode", "cfg_mask_gain", "cfg_mask_plane",
+                           "use_camera_drop", "uncond_mode", "total_view")}
+        with torch.no_grad():
+            tv = torch.full((sample_input_flat.shape[0],), float(velocity_t),
+                            device=device, dtype=sample_input_flat.dtype)
+            v = model(sample_input_flat, tv, total_view, **vk)
+        if is_concat_mode:
+            v = v[:, :latent_dim]
+        # per-token L2 over channels -> (BV, 1, h, w); the caller pools/normalises
+        return {"velocity": v.float().pow(2).sum(dim=1, keepdim=True).sqrt()}
 
     # ========== 4. Diffusion Sampling ==========
     with torch.no_grad():

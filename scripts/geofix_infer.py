@@ -490,6 +490,20 @@ def main() -> int:
     ap.add_argument("--bridge-noise-tau", type=float, default=0.0,
                     help="Start-noise scale for --bridge-x0. Set it to the value "
                          "the checkpoint trained with (geofix.bridge_noise_tau).")
+    # THE ZERO-SHOT VELOCITY MASK. See `get_denoised_features`' section 4a.
+    ap.add_argument("--velocity-mask", action="store_true",
+                    help="Write ||v_theta(x0, t)|| per token into the mask packs "
+                         "INSTEAD of sampling images. Under `bridge_x0: artifact` "
+                         "the velocity at the artifact end is the transport's own "
+                         "estimate of how far each token must move to become clean "
+                         "-- a damage map needing no trained head.")
+    ap.add_argument("--velocity-plane", default="velmask",
+                    help="plane name for --velocity-mask")
+    ap.add_argument("--velocity-t", type=float, default=1.0,
+                    help="t at which the velocity is read. 1.0 is the ARTIFACT end: "
+                         "integrators.py uses `1 - linspace(t0,t1)` so sampling runs "
+                         "t: 1 -> 0. Reading 0.0 measures the CLEAN end, which is a "
+                         "different quantity that still looks plausible.")
     ap.add_argument("--bridge-mask-noise", action="store_true",
                     help="THE MASK-MODULATED BRIDGE at sampling time: sigma_i = "
                          "tau * M_edit_i per token, matching training. Needs "
@@ -1204,7 +1218,40 @@ def main() -> int:
             geofix_bridge_noise_tau=args.bridge_noise_tau,
             geofix_bridge_mask_noise=args.bridge_mask_noise,
             geofix_bridge_mask=msk_bridge,
+            velocity_only=bool(getattr(args, "velocity_mask", False)),
+            velocity_t=float(getattr(args, "velocity_t", 1.0)),
         )
+        if getattr(args, "velocity_mask", False):
+            # ZERO-SHOT VELOCITY MASK. `get_denoised_features` returned the raw
+            # per-token ||v|| instead of samples, so there is nothing to decode:
+            # normalise per frame to [0,1] like every other plane and write it into
+            # the mask packs. `edit1` polarity holds by construction -- a large
+            # velocity means "this token must move a long way to become clean",
+            # which is "repair here".
+            import numpy as _np, tempfile as _tf, os as _os
+            v = feat[1]["velocity"]                        # (BV, 1, h, w)
+            v = v.reshape(len(stems) + cond, 1, *v.shape[-2:])[cond:]
+            for k, stem in enumerate(stems):
+                a = v[k, 0].float().cpu().numpy()
+                lo, hi = float(a.min()), float(a.max())
+                a = (a - lo) / max(hi - lo, 1e-6)
+                npz = pathlib.Path(man["artifact_root"]) / split / "masks" / f"{stem}.edit1.npz"
+                if not npz.is_file():
+                    continue
+                with _np.load(npz, allow_pickle=True) as z:
+                    d = {kk: z[kk] for kk in z.files}
+                g = d["oracle_l2"].shape[0]
+                up = _np.repeat(_np.repeat(a, g // a.shape[0], 0), g // a.shape[1], 1)
+                d[args.velocity_plane] = (up * 255).astype(_np.uint8)
+                d[args.velocity_plane + "__src"] = _np.array(json.dumps({
+                    "recipe": f"||v_theta(x0, t={args.velocity_t})|| per token, "
+                              "min-max per frame",
+                    "checkpoint": str(args.ckpt_level1), "written": "2026-09-08"}))
+                fd, tmp = _tf.mkstemp(dir=str(npz.parent), suffix=".npz"); _os.close(fd)
+                with open(tmp, "wb") as fh:
+                    _np.savez_compressed(fh, **d)
+                _os.replace(tmp, npz)
+            continue
         feat_denorm[1] = rae._denormalize(feat[1])
 
         # --- stage 2: L1 -> L0, the learned cascade ---------------------------
