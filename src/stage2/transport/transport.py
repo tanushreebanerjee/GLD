@@ -213,7 +213,19 @@ class Transport:
         
         terms = {}
         terms['pred'] = model_output
-        if self.model_type == ModelType.VELOCITY:
+        # GeoFix: heteroscedastic velocity loss. `_logvar` is stashed by `DDT.forward`
+        # only when the model was built with `hetero=True`; `getattr` keeps this inert
+        # for the wrapped/EMA/compiled modules that do not have the attribute at all.
+        _lv = getattr(getattr(model, 'module', model), '_logvar', None)
+        if self.model_type == ModelType.VELOCITY and _lv is not None:
+            # At step 0 the head is zero-init, so logvar = 0 and this is EXACTLY
+            # `mean_flat((model_output - ut) ** 2)` -- the branch below, unchanged. The
+            # arm therefore differs from its control in the variance head alone
+            # (hard rule 14), and any divergence is the reweighting doing work rather
+            # than a different objective being optimised from the start.
+            from stage2.models.hetero_head import hetero_nll
+            terms['loss'] = hetero_nll(model_output, ut, _lv)
+        elif self.model_type == ModelType.VELOCITY:
             terms['loss'] = mean_flat(((model_output - ut) ** 2))
         else: 
             _, drift_var = self.path_sampler.compute_drift(xt, t)

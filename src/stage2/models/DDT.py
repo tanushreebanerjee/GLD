@@ -213,6 +213,7 @@ class DiTwDDTHead(nn.Module):
             cfg_mode: str = "new",          # "new" (drop pose/intrinsics) or "old" (keep pose/intrinsics)
             num_special_tokens: int = 0,    # number of special tokens (e.g. 5 for VGGT camera+register)
             n_mask: int = 0,                # GeoFix session 7: extra INPUT channels for uncertainty masks
+            hetero: bool = False,           # GeoFix: predict (velocity, log-variance), see models/hetero_head.py
     ):
         super().__init__()
         self.level = level
@@ -341,6 +342,20 @@ class DiTwDDTHead(nn.Module):
         # print(f"x_channel_per_token: {x_channel_per_token}, s_channel_per_token: {s_channel_per_token}")
         self.final_layer = DDTFinalLayer(
             self.decoder_hidden_size, 1, self.x_channel_per_token, use_rmsnorm=use_rmsnorm)
+        # GeoFix: an ADDITIVE, zero-initialised log-variance head. `hetero=False` is the
+        # default and builds nothing, so every existing config and every released
+        # checkpoint is byte-for-byte unaffected -- the same inertness contract session 7
+        # established for `n_mask`. Widening `final_layer.linear` instead would change a
+        # pretrained tensor's shape and break `load_state_dict` on the released file.
+        self.hetero = bool(hetero)
+        self.logvar_head = None
+        if self.hetero:
+            from stage2.models.hetero_head import LogVarHead
+            self.logvar_head = LogVarHead(
+                self.decoder_hidden_size, self.x_channel_per_token,
+                use_rmsnorm=use_rmsnorm)
+        #: stashed by `forward` when `hetero` is on; read by `transport.training_losses`.
+        self._logvar = None
         # Will use fixed sin-cos embedding:
         if use_pos_embed:
             num_patches = self.s_embedder_ref.num_patches
@@ -868,6 +883,19 @@ class DiTwDDTHead(nn.Module):
             current_pag_mode = pag_mode if (pag_layer_idx is None or i == pag_layer_idx) else False
             x_toks = self.blocks[i](x_toks, s, feat_rope=dec_rope, total_view=total_view, pag_mode=current_pag_mode, prope_image_size=prope_image_size, patches_layout=(Hx, Wx), num_prefix_tokens=K if has_special else 0, **kwargs)
 
+        if self.logvar_head is not None:
+            # The SAME hidden states `final_layer` is about to consume, so the variance
+            # is a statement about the token the mean was read from -- not about some
+            # earlier or later representation.
+            if has_special or has_cls:
+                raise NotImplementedError(
+                    "hetero=True with special or cls tokens: the output tail repacks "
+                    "those branches differently, and a log-variance built on the plain "
+                    "branch would come out a different shape from the prediction it is "
+                    "supposed to weight. `hetero_nll` asserts the shapes match, so this "
+                    "would fail there instead -- it is refused here, where the cause is "
+                    "legible.")
+            self._logvar = self.unpatchify(self.logvar_head(x_toks), Hx, Wx)
         x_toks = self.final_layer(x_toks, s)
 
         if has_special:
