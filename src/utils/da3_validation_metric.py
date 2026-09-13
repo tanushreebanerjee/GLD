@@ -437,7 +437,13 @@ def get_denoised_features(
                             device=device, dtype=sample_input_flat.dtype)
             v = model(sample_input_flat, tv, total_view, **vk)
         if is_concat_mode:
-            v = v[:, :latent_dim]
+            # `x` is [condition | noisy] under concat mode and the model returns a
+            # velocity for the NOISY half only in the second block -- the same
+            # slice the sampler takes below (`samples[:, C_lat:]`). `latent_dim`
+            # does not exist in this function; it is `C_lat` here and
+            # `latent_dim` in `get_denoised_features_vae`, which is how this was
+            # wrong the first time.
+            v = v[:, C_lat:] if v.shape[1] > C_lat else v
         # per-token L2 over channels -> (BV, 1, h, w); the caller pools/normalises
         return {"velocity": v.float().pow(2).sum(dim=1, keepdim=True).sqrt()}
 

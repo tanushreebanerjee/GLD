@@ -1229,13 +1229,16 @@ def main() -> int:
             # velocity means "this token must move a long way to become clean",
             # which is "repair here".
             import numpy as _np, tempfile as _tf, os as _os
-            v = feat[1]["velocity"]                        # (BV, 1, h, w)
-            v = v.reshape(len(stems) + cond, 1, *v.shape[-2:])[cond:]
+            # NOT `v`: that name is `num_views` (line ~872) and rebinding it here
+            # would silently corrupt every later iteration of this loop.
+            _vel = feat[1]["velocity"]                     # (BV, 1, h, w)
+            _vel = _vel.reshape(len(stems) + cond, 1, *_vel.shape[-2:])[cond:]
             for k, stem in enumerate(stems):
-                a = v[k, 0].float().cpu().numpy()
+                a = _vel[k, 0].float().cpu().numpy()
                 lo, hi = float(a.min()), float(a.max())
                 a = (a - lo) / max(hi - lo, 1e-6)
-                npz = pathlib.Path(man["artifact_root"]) / split / "masks" / f"{stem}.edit1.npz"
+                npz = (pathlib.Path(manifest["artifact_root"]) / split / "masks"
+                       / f"{stem}.edit1.npz")
                 if not npz.is_file():
                     continue
                 with _np.load(npz, allow_pickle=True) as z:
@@ -1246,7 +1249,9 @@ def main() -> int:
                 d[args.velocity_plane + "__src"] = _np.array(json.dumps({
                     "recipe": f"||v_theta(x0, t={args.velocity_t})|| per token, "
                               "min-max per frame",
-                    "checkpoint": str(args.ckpt_level1), "written": "2026-09-08"}))
+                    "checkpoint": str(getattr(args, "ckpt_l1", None) or
+                                              getattr(args, "checkpoint_level1", "?")),
+                    "written": "2026-09-08"}))
                 fd, tmp = _tf.mkstemp(dir=str(npz.parent), suffix=".npz"); _os.close(fd)
                 with open(tmp, "wb") as fh:
                     _np.savez_compressed(fh, **d)
