@@ -130,7 +130,7 @@ stage_1:
     # against 0.136 for artifacts and 0.014 for resolution. So the released
     # RE10K-derived file is wrong for us even setting artifacts aside.
     # Leg C = DL3DV + artifacts + 504 + ImageNet normalisation.
-    normalization_stat_path: '/fs/nexus-projects/Generative_Detection/workspace/research/uncertainty-guided-diffusion/geofix/eval/feature_stats/legs/dl3dv_art_504__imagenet/normalization_stats_level1.pt'
+    normalization_stat_path: '${oc.env:GEOFIX_ROOT}/eval/feature_stats/legs/dl3dv_art_504__imagenet/normalization_stats_level1.pt'
 
 stage_2:
   target: stage2.models.DDT.DiTwDDTHead
@@ -349,10 +349,10 @@ dataset:
   name: geofix
 
   # Absolute: training runs from the GLD fork worktree, not from geofix/.
-  manifest: /fs/nexus-projects/Generative_Detection/workspace/research/uncertainty-guided-diffusion/geofix/eval/train/manifest_masked_exclude_oracleabs.json
+  manifest: ${oc.env:GEOFIX_ROOT}/eval/train/manifest_masked_exclude_oracleabs.json
   # The frozen holdout, it_03000 only. Shares 0 splits AND 0 (level, scene, run)
   # reconstructions with the training manifest.
-  val_manifest: /fs/nexus-projects/Generative_Detection/workspace/research/uncertainty-guided-diffusion/geofix/eval/train/manifest_holdout_it03000_oracleabs.json
+  val_manifest: ${oc.env:GEOFIX_ROOT}/eval/train/manifest_holdout_it03000_oracleabs.json
 
   # THE PLANE. `oracle_abs` = per-pixel mean |RGB difference|, which is the same
   # formula `session8_panel._diff_map` draws the edit map with, and carries ~5x

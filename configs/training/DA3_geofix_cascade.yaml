@@ -163,7 +163,7 @@ stage_1:
     # its level-0 member. That is required, not merely tidy: the cascade is
     # finetuned to consume what the finetuned level-1 model emits, and two legs
     # would put the two stages in different spaces.
-    normalization_stat_path: '/fs/nexus-projects/Generative_Detection/workspace/research/uncertainty-guided-diffusion/geofix/eval/feature_stats/legs/dl3dv_art_504__imagenet/normalization_stats_level0.pt'
+    normalization_stat_path: '${oc.env:GEOFIX_ROOT}/eval/feature_stats/legs/dl3dv_art_504__imagenet/normalization_stats_level0.pt'
     # PRESENT, and it was deliberately absent until the smoke test failed.
     #
     # The original reasoning was that `DA3_cascade.yaml` omits `mae_weight`, so
@@ -363,7 +363,7 @@ training:
   # normalised with its own statistics; using the released level-1 file here
   # while the level-1 MODEL was finetuned under our leg would feed the cascade a
   # differently-normalised x0 than the one it meets at inference.
-  source_level_stat_path: '/fs/nexus-projects/Generative_Detection/workspace/research/uncertainty-guided-diffusion/geofix/eval/feature_stats/legs/dl3dv_art_504__imagenet/normalization_stats_level1.pt'
+  source_level_stat_path: '${oc.env:GEOFIX_ROOT}/eval/feature_stats/legs/dl3dv_art_504__imagenet/normalization_stats_level1.pt'
   noise_tau_gt_feat: 0.0
 
 validation:
@@ -411,8 +411,8 @@ dataset:
   # being finetuned to sit downstream of that model, and a different train/eval
   # split between the two stages would leak held-out scenes into the pipeline
   # through the back door.
-  manifest: /fs/nexus-projects/Generative_Detection/workspace/research/uncertainty-guided-diffusion/geofix/eval/train/manifest_masked_exclude.json
-  val_manifest: /fs/nexus-projects/Generative_Detection/workspace/research/uncertainty-guided-diffusion/geofix/eval/train/manifest_holdout_it03000.json
+  manifest: ${oc.env:GEOFIX_ROOT}/eval/train/manifest_masked_exclude.json
+  val_manifest: ${oc.env:GEOFIX_ROOT}/eval/train/manifest_holdout_it03000.json
 
   # Mask planes stacked in order; must match what the manifest recorded.
   mask_types: [oracle_lpips]
