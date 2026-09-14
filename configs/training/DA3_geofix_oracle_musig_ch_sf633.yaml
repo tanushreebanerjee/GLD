@@ -1,41 +1,41 @@
-# CAN THE REFINER USE COLOUR ERROR, OR ONLY MAGNITUDE?  (ORACLE CEILING)
+# DOES THE WITHIN-PATCH SPREAD OF THE ERROR HELP?  (ORACLE CEILING)
 #
 # DERIVED FROM `DA3_geofix_oracle_ch_sf633.yaml` -- the 1-channel ORACLE arm in the
 # widened lane, which is this arm's exact control -- differing in `n_mask`, `mask_types`
-# and the two manifests that carry those planes.
+# and the two manifests.
 #
-# ## The claim
+# ## The idea
 #
-# Every mask this project has fed a refiner is a MAGNITUDE. `oracle_l2` is
-# `sqrt(mean_c (render_c - gt_c)^2)`, an RMS reduction over RGB, so the conditioner
-# learns how wrong a token is and never WHICH CHANNEL is wrong. A 3DGS floater is
-# typically a colour error, so that reduction may be discarding usable structure.
+# `oracle_l2` reaches the conditioner MAX-pooled from 504 to 36x36. MAX keeps the worst
+# pixel in each 14x14 patch and throws away how the damage is DISTRIBUTED inside it, so a
+# token covering uniform moderate error and a token covering one thin bright floater
+# arrive identical. `oracle_sigma` is the standard deviation over that same patch, which
+# is exactly the discarded quantity.
 #
-# Per-channel error is strictly MORE information than `oracle_l2` contains. That is why
-# this is a different experiment from per-channel SUPERVISION, which was run and is a
-# null (`bridge_rgb3`: +0.0025 rho against the 1-channel arm over five matched steps,
-# inside the 0.0068 seed floor). Supervision cannot beat a target that is itself the
-# reduction; CONDITIONING can, because it hands the refiner something the oracle plane
-# does not have. So unlike every other mask arm, this one could in principle EXCEED the
-# oracle ceiling rather than approach it.
+# Measured before building the arm: corr(mu, sigma) within a frame is +0.845, and
+# **27% of sigma's variance is not explained by mu**. So it is largely redundant and
+# partly new -- enough to be worth one arm, not enough to expect a large effect.
 #
-# ## Why the oracle and not a MaskNet
+# ## Why this sigma is not the sigma we already proved worthless
 #
-# The ceiling is the cheap half. If three PERFECT per-channel planes do not beat one
-# perfect magnitude plane, the information is unusable and no 3-channel predictor need
-# ever be built. Only if it wins does a MaskNet for it become worth training. Running the
-# predictor first would confound "the information does not help" with "our predictor is
-# not good enough", and the mask-fidelity ladder says our predictors sit ~9% of the way
-# to the oracle -- far too weak to settle a question about the ceiling.
+# The bridge arms ship an EPISTEMIC sigma from a heteroscedastic NLL -- "how unsure the
+# network is". That one carries nothing downstream: feeding `mu` twice, with sigma
+# replaced by a byte-copy of mu, reproduces the (mu,sigma) arm to three decimals
+# (18.169 both, t 4.74 both). THIS sigma is ALEATORIC and observable -- a property of the
+# error map defined without reference to any model -- so it has a ground-truth value and
+# can be supervised with plain L2 rather than emerging from a likelihood.
 #
-# ## What it is measured against
+# ## Ceiling first, as with the colour arm
 #
-# `sf633_ch_oracle_s6000` -- same widened lane, same trunk, same bridge settings, one
-# oracle magnitude plane. Both are ORACLE arms and must be labelled "ORACLE (uses GT)"
-# wherever reported; neither is deployable.
+# If a refiner given the PERFECT magnitude and the PERFECT spread does not beat one given
+# the perfect magnitude alone, no predictor of sigma need ever be trained. Only if it wins
+# does the MaskNet version -- supervising mu and sigma jointly under L2 -- become worth a
+# run. Both arms here are ORACLE arms and must be labelled "ORACLE (uses GT)".
 #
-# The planes are `oracle_{r,g,b}`: per-channel |render - gt| MAX-pooled to 36x36, pooled
-# area 0.260 against `oracle_l2`'s 0.244, so MAX stays valid (hard rule 6).
+# Pooling is deliberately asymmetric: mu uses MAX (hard rule 6 -- a thin bright floater
+# must survive), sigma uses std over the identical 14x14 partition, since the quantity of
+# interest IS the spread. `oracle_sigma` is stored with gain 2.5; the largest observed
+# within-patch std is 0.3849, so nothing clips.
 
 stage_1:
   target: stage1.rae_da3.RAE_DA3
@@ -80,7 +80,7 @@ stage_2:
     # The widening. Zero-init, so step 0 reproduces the released
     # checkpoint exactly (session-7 inertness gate). Must equal
     # len(dataset.mask_types); the trainer checks all three.
-    n_mask: 3          # THE KNOB: three per-channel planes instead of one magnitude
+    n_mask: 2          # THE KNOB: (magnitude, within-patch spread)
     predict_cls: false
     is_concat_mode: true
 
@@ -295,13 +295,13 @@ dataset:
   name: geofix
 
   # Absolute: training runs from the GLD fork worktree, not from geofix/.
-  manifest: ${oc.env:GEOFIX_ROOT}/eval/train/manifest_syncfix_train_oracle_rgb.json
+  manifest: ${oc.env:GEOFIX_ROOT}/eval/train/manifest_syncfix_train_musig_oracle.json
   # The frozen holdout, it_03000 only. Shares 0 splits AND 0 (level, scene, run)
   # reconstructions with the training manifest.
-  val_manifest: ${oc.env:GEOFIX_ROOT}/eval/train/manifest_holdout2_oracle_rgb.json
+  val_manifest: ${oc.env:GEOFIX_ROOT}/eval/train/manifest_holdout2_musig_oracle.json
 
   # Mask planes stacked in order; must match what the manifest recorded.
-  mask_types: [oracle_r, oracle_g, oracle_b]
+  mask_types: [oracle_l2, oracle_sigma]
   token_grid: 36
   # Contrast exponent on the POOLED mask. 1.0 = untouched. The blend's optimum
   # was a mask AREA of ~0.45. The numbers this comment used to carry --
